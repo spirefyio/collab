@@ -1,0 +1,16 @@
+.{
+    .name = .collab,
+    .version = "0.0.1",
+    .fingerprint = 0xcba71ca6dff379a7,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

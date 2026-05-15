@@ -1,3 +1,118 @@
+# Zig build outputs
+zig-cache/
 .zig-cache/
 zig-out/
+
+# Go build outputs
+server/bin/
+server/dist/
+server/server
+server/server.exe
+*.test
+*.out
+
+# Compiled artifacts / object files
 *.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.wasm
+*.exe
+
+# OS files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+*.sublime-workspace
+*.sublime-project
+.history/
+
+# Logs / runtime data
+*.log
+logs/
+tmp/
+temp/
+*.pid
+*.seed
+snapshots/
+*.snapshot
+
+# Coverage / profiling
+coverage/
+*.cov
+*.profraw
+*.profdata
+
+# Secrets — NEVER commit (use .env.example as the tracked template)
+.env
+.env.local
+.env.*.local
+.env.production
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+trusted-keys/
+
+# Backups / merge debris
+*.bak
+*.orig
+*.rej
+*.old
+
+# Large media (commit intentionally with `git add -f` if a doc needs one)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.iso
+*.dmg
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.psd
+*.ai
+*.sketch
+
+# DB dumps / runtime data
+*.sql.gz
+*.dump
+*.backup
+postgres-data/
+pgdata/
+
+# Docker runtime volumes
+.docker/
+docker-volumes/
+
+# Node (in case a docs site is added later)
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python (in case any tooling scripts arrive)
+__pycache__/
+*.pyc
+.venv/
+venv/
