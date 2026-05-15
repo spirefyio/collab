@@ -6,6 +6,7 @@ require (
 	github.com/casbin/casbin/v2 v2.135.0
 	github.com/go-chi/chi/v5 v5.2.5
 	github.com/go-chi/jwtauth/v5 v5.4.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/lestrrat-go/jwx/v3 v3.0.2
 )
 

@@ -24,6 +24,7 @@ import (
 	"github.com/spirefyio/collab/server/internal/api"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
+	"github.com/spirefyio/collab/server/internal/relay"
 )
 
 const shutdownGrace = 30 * time.Second
@@ -40,9 +41,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	relayCfg := relay.DefaultConfig()
+	relayCfg.ReadBufferBytes = cfg.WSReadBufferBytes
+	relayCfg.WriteBufferBytes = cfg.WSWriteBufferBytes
+	hub := relay.NewHub(relayCfg, logger)
+	logger.Info("relay hub ready",
+		"max_peers_per_room", relayCfg.MaxPeersPerRoom,
+		"max_message_bytes", relayCfg.MaxMessageBytes,
+	)
+
 	deps := api.Deps{
-		Config: cfg,
-		Logger: logger,
+		Config:   cfg,
+		Logger:   logger,
+		RelayHub: hub,
 	}
 	if len(cfg.JWTSecret) >= 32 {
 		issuer, err := auth.NewIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAudience, cfg.JWTTTL)

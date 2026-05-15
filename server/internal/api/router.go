@@ -15,6 +15,7 @@ import (
 	"github.com/spirefyio/collab/server/internal/acl"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
+	"github.com/spirefyio/collab/server/internal/relay"
 )
 
 // Deps bundles the cross-cutting handles the router needs. Fields may
@@ -26,6 +27,7 @@ type Deps struct {
 	Logger   *slog.Logger
 	Issuer   *auth.Issuer
 	Enforcer *acl.Enforcer
+	RelayHub *relay.Hub
 }
 
 func NewRouter(deps Deps) *chi.Mux {
@@ -38,6 +40,13 @@ func NewRouter(deps Deps) *chi.Mux {
 
 	r.Get("/", rootHandler)
 	r.Get("/health", healthHandler)
+
+	// Relay surface — open by default (room code is the secret in ad-hoc
+	// mode). Team mode wraps this in jwtauth + casbin via a future commit
+	// that adds /team-relay/ws with an Authorization-header gate.
+	if deps.RelayHub != nil {
+		r.Get("/relay/ws", deps.RelayHub.Handler())
+	}
 
 	// Protected surface — only mounted when JWT issuance is configured.
 	// jwtauth.Verifier reads the token from the Authorization header or
