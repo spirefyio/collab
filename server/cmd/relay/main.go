@@ -24,7 +24,9 @@ import (
 	"github.com/spirefyio/collab/server/internal/api"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
+	dbpkg "github.com/spirefyio/collab/server/internal/db"
 	"github.com/spirefyio/collab/server/internal/relay"
+	"github.com/spirefyio/collab/server/migrations"
 )
 
 const shutdownGrace = 30 * time.Second
@@ -54,6 +56,24 @@ func main() {
 		Config:   cfg,
 		Logger:   logger,
 		RelayHub: hub,
+	}
+
+	if cfg.DatabaseURL != "" {
+		logger.Info("running database migrations")
+		if err := dbpkg.RunUp(cfg.DatabaseURL, migrations.FS); err != nil {
+			logger.Error("migration failed", "err", err)
+			os.Exit(2)
+		}
+		pool, err := dbpkg.NewPool(context.Background(), cfg.DatabaseURL)
+		if err != nil {
+			logger.Error("db pool open failed", "err", err)
+			os.Exit(2)
+		}
+		defer pool.Close()
+		deps.DB = pool
+		logger.Info("postgres pool ready")
+	} else {
+		logger.Warn("COLLAB_DATABASE_URL unset — db features disabled; /health/ready reports db=not-configured")
 	}
 	if len(cfg.JWTSecret) >= 32 {
 		issuer, err := auth.NewIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAudience, cfg.JWTTTL)

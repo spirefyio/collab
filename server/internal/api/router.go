@@ -12,6 +12,8 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/jwtauth/v5"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/spirefyio/collab/server/internal/acl"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
@@ -28,6 +30,7 @@ type Deps struct {
 	Issuer   *auth.Issuer
 	Enforcer *acl.Enforcer
 	RelayHub *relay.Hub
+	DB       *pgxpool.Pool
 }
 
 func NewRouter(deps Deps) *chi.Mux {
@@ -40,6 +43,7 @@ func NewRouter(deps Deps) *chi.Mux {
 
 	r.Get("/", rootHandler)
 	r.Get("/health", healthHandler)
+	r.Get("/health/ready", readinessHandler(deps))
 
 	// Relay surface — open by default (room code is the secret in ad-hoc
 	// mode). Team mode wraps this in jwtauth + casbin via a future commit
