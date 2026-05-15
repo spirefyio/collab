@@ -4,22 +4,44 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const collab_module = b.addModule("collab", .{
-        .root_source_file = b.path("src/collab/lib.zig"),
+    const zora_dep = b.dependency("zora", .{
         .target = target,
         .optimize = optimize,
     });
-    _ = collab_module;
+    const zora_mod = zora_dep.module("zora");
 
-    const lib_unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/collab/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const desktop_dep = b.dependency("desktop", .{
+        .target = target,
+        .optimize = optimize,
     });
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const compat_mod = desktop_dep.module("compat");
+    const util_json_mod = desktop_dep.module("util_json");
 
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    const collab_mod = b.addModule("collab", .{
+        .root_source_file = b.path("src/collab/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    collab_mod.addImport("zora", zora_mod);
+    collab_mod.addImport("compat", compat_mod);
+    collab_mod.addImport("util_json", util_json_mod);
+
+    const collab_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/collab/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    collab_test_mod.addImport("zora", zora_mod);
+    collab_test_mod.addImport("compat", compat_mod);
+    collab_test_mod.addImport("util_json", util_json_mod);
+
+    const collab_tests = b.addTest(.{
+        .name = "collab-tests",
+        .root_module = collab_test_mod,
+    });
+
+    const test_step = b.step("test", "Run collab tests");
+    test_step.dependOn(&b.addRunArtifact(collab_tests).step);
 }
