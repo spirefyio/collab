@@ -1,0 +1,69 @@
+# Local development stack for spirefyio/collab/server.
+#
+# Two services:
+#   - postgres   PostgreSQL 16 (data persisted in named volume)
+#   - server     the collab-server binary
+#
+# Both services can be replaced by external instances by overriding the
+# COLLAB_DATABASE_URL env var on the `server` service to point at an
+# existing Postgres (managed RDS, Cloud SQL, etc.), and by simply not
+# starting the `postgres` service.
+#
+# Quick start:
+#   docker compose up --build
+#   curl http://localhost:8443/health
+#   curl http://localhost:8443/health/ready
+#
+# Stop + clean (drops data!):
+#   docker compose down --volumes
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: collab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-collab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-collab}
+      POSTGRES_DB: ${POSTGRES_DB:-collab}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-collab} -d ${POSTGRES_DB:-collab}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-0.0.1-dev}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    container_name: collab-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      COLLAB_LISTEN_ADDR: ":8443"
+      COLLAB_PRODUCTION: "${COLLAB_PRODUCTION:-0}"
+      COLLAB_DATABASE_URL: "${COLLAB_DATABASE_URL:-postgres://collab:collab@postgres:5432/collab?sslmode=disable}"
+      COLLAB_JWT_SECRET: "${COLLAB_JWT_SECRET:-dev-only-do-not-use-in-production-32}"
+      COLLAB_JWT_ISSUER: "${COLLAB_JWT_ISSUER:-spirefyio/collab}"
+      COLLAB_JWT_AUDIENCE: "${COLLAB_JWT_AUDIENCE:-spirefy-collab-clients}"
+      COLLAB_JWT_TTL: "${COLLAB_JWT_TTL:-24h}"
+      COLLAB_OAUTH_REDIRECT_BASE_URL: "${COLLAB_OAUTH_REDIRECT_BASE_URL:-}"
+      COLLAB_OAUTH_GOOGLE_CLIENT_ID: "${COLLAB_OAUTH_GOOGLE_CLIENT_ID:-}"
+      COLLAB_OAUTH_GOOGLE_CLIENT_SECRET: "${COLLAB_OAUTH_GOOGLE_CLIENT_SECRET:-}"
+      COLLAB_OAUTH_GITHUB_CLIENT_ID: "${COLLAB_OAUTH_GITHUB_CLIENT_ID:-}"
+      COLLAB_OAUTH_GITHUB_CLIENT_SECRET: "${COLLAB_OAUTH_GITHUB_CLIENT_SECRET:-}"
+    ports:
+      - "${SERVER_HOST_PORT:-8443}:8443"
+
+volumes:
+  postgres-data:

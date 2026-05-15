@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS audit_log;
+DROP TABLE IF EXISTS invites;
+DROP TABLE IF EXISTS workspaces;
+DROP TABLE IF EXISTS team_members;
+DROP TYPE  IF EXISTS team_role;
+DROP TABLE IF EXISTS teams;
+DROP TABLE IF EXISTS accounts;
