@@ -4,7 +4,10 @@
     .fingerprint = 0xcba71ca6dff379a7,
     .minimum_zig_version = "0.16.0",
 
-    .dependencies = .{},
+    .dependencies = .{
+        .zora = .{ .path = "../zora" },
+        .desktop = .{ .path = "../desktop" },
+    },
 
     .paths = .{
         "build.zig",
