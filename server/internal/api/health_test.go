@@ -6,22 +6,49 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
 )
 
 func newTestRouter(t *testing.T) http.Handler {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewRouter(&config.Config{
-		ListenAddr:         ":0",
-		WSReadBufferBytes:  4096,
-		WSWriteBufferBytes: 4096,
-	}, logger)
+	return NewRouter(Deps{
+		Config: &config.Config{
+			ListenAddr:         ":0",
+			WSReadBufferBytes:  4096,
+			WSWriteBufferBytes: 4096,
+		},
+		Logger: logger,
+	})
+}
+
+func newTestRouterWithAuth(t *testing.T) (http.Handler, *auth.Issuer) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+	secret := []byte(strings.Repeat("k", 32))
+	issuer, err := auth.NewIssuer(secret, "spirefyio/collab", "spirefy-collab-clients", time.Hour)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	r := NewRouter(Deps{
+		Config: &config.Config{
+			ListenAddr:         ":0",
+			WSReadBufferBytes:  4096,
+			WSWriteBufferBytes: 4096,
+			JWTSecret:          secret,
+			JWTIssuer:          "spirefyio/collab",
+			JWTAudience:        "spirefy-collab-clients",
+			JWTTTL:             time.Hour,
+		},
+		Logger: logger,
+		Issuer: issuer,
+	})
+	return r, issuer
 }
 
 func TestHealthHandler_ReturnsOK(t *testing.T) {
@@ -76,5 +103,4 @@ func TestHealthHandler_DoesNotLeakEnv(t *testing.T) {
 	if strings.Contains(rr.Body.String(), "sensitive-do-not-leak") {
 		t.Fatal("response body leaked env var contents")
 	}
-	_ = os.Environ
 }

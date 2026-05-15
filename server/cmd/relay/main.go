@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/spirefyio/collab/server/internal/api"
+	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
 )
 
@@ -38,7 +39,23 @@ func main() {
 		os.Exit(2)
 	}
 
-	router := api.NewRouter(cfg, logger)
+	deps := api.Deps{
+		Config: cfg,
+		Logger: logger,
+	}
+	if len(cfg.JWTSecret) >= 32 {
+		issuer, err := auth.NewIssuer(cfg.JWTSecret, cfg.JWTIssuer, cfg.JWTAudience, cfg.JWTTTL)
+		if err != nil {
+			logger.Error("jwt issuer init failed", "err", err)
+			os.Exit(2)
+		}
+		deps.Issuer = issuer
+		logger.Info("jwt issuer ready", "iss", cfg.JWTIssuer, "aud", cfg.JWTAudience, "ttl", cfg.JWTTTL)
+	} else {
+		logger.Warn("jwt issuer not configured (COLLAB_JWT_SECRET unset or < 32 bytes) — /me disabled")
+	}
+
+	router := api.NewRouter(deps)
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           router,
