@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/jwtauth/v5"
 
+	"github.com/spirefyio/collab/server/internal/acl"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
 )
@@ -21,9 +22,10 @@ import (
 // COLLAB_JWT_SECRET is unset and we're in dev mode — protected routes
 // are not mounted in that case).
 type Deps struct {
-	Config *config.Config
-	Logger *slog.Logger
-	Issuer *auth.Issuer
+	Config   *config.Config
+	Logger   *slog.Logger
+	Issuer   *auth.Issuer
+	Enforcer *acl.Enforcer
 }
 
 func NewRouter(deps Deps) *chi.Mux {
@@ -44,7 +46,16 @@ func NewRouter(deps Deps) *chi.Mux {
 		r.Group(func(pr chi.Router) {
 			pr.Use(jwtauth.Verifier(deps.Issuer.TokenAuth()))
 			pr.Use(jwtauth.Authenticator(deps.Issuer.TokenAuth()))
+
+			// Any authenticated user.
 			pr.Get("/me", meHandler)
+
+			// Role-gated surface — requires both JWT and casbin enforcer.
+			// Full team/workspace CRUD lands in follow-up commits; the
+			// demo endpoint below proves the pipe.
+			if deps.Enforcer != nil {
+				pr.With(RequireAccess(deps.Enforcer)).Get("/teams/{teamID}/probe", teamProbeHandler)
+			}
 		})
 	}
 

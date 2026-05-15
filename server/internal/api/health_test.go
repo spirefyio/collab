@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spirefyio/collab/server/internal/acl"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
 )
@@ -29,13 +30,24 @@ func newTestRouter(t *testing.T) http.Handler {
 
 func newTestRouterWithAuth(t *testing.T) (http.Handler, *auth.Issuer) {
 	t.Helper()
+	r, issuer, _ := newTestRouterFull(t, false)
+	return r, issuer
+}
+
+func newTestRouterWithACL(t *testing.T) (http.Handler, *auth.Issuer, *acl.Enforcer) {
+	t.Helper()
+	return newTestRouterFull(t, true)
+}
+
+func newTestRouterFull(t *testing.T, withACL bool) (http.Handler, *auth.Issuer, *acl.Enforcer) {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	secret := []byte(strings.Repeat("k", 32))
 	issuer, err := auth.NewIssuer(secret, "spirefyio/collab", "spirefy-collab-clients", time.Hour)
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)
 	}
-	r := NewRouter(Deps{
+	deps := Deps{
 		Config: &config.Config{
 			ListenAddr:         ":0",
 			WSReadBufferBytes:  4096,
@@ -47,8 +59,19 @@ func newTestRouterWithAuth(t *testing.T) (http.Handler, *auth.Issuer) {
 		},
 		Logger: logger,
 		Issuer: issuer,
-	})
-	return r, issuer
+	}
+	var enf *acl.Enforcer
+	if withACL {
+		enf, err = acl.NewEnforcer()
+		if err != nil {
+			t.Fatalf("NewEnforcer: %v", err)
+		}
+		if err := enf.SeedDefaults(); err != nil {
+			t.Fatalf("SeedDefaults: %v", err)
+		}
+		deps.Enforcer = enf
+	}
+	return NewRouter(deps), issuer, enf
 }
 
 func TestHealthHandler_ReturnsOK(t *testing.T) {

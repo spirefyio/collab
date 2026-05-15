@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spirefyio/collab/server/internal/acl"
 	"github.com/spirefyio/collab/server/internal/api"
 	"github.com/spirefyio/collab/server/internal/auth"
 	"github.com/spirefyio/collab/server/internal/config"
@@ -51,8 +52,20 @@ func main() {
 		}
 		deps.Issuer = issuer
 		logger.Info("jwt issuer ready", "iss", cfg.JWTIssuer, "aud", cfg.JWTAudience, "ttl", cfg.JWTTTL)
+
+		enf, err := acl.NewEnforcer()
+		if err != nil {
+			logger.Error("acl enforcer init failed", "err", err)
+			os.Exit(2)
+		}
+		if err := enf.SeedDefaults(); err != nil {
+			logger.Error("acl seed failed", "err", err)
+			os.Exit(2)
+		}
+		deps.Enforcer = enf
+		logger.Info("acl enforcer ready", "policies", len(enf.Policies()))
 	} else {
-		logger.Warn("jwt issuer not configured (COLLAB_JWT_SECRET unset or < 32 bytes) — /me disabled")
+		logger.Warn("jwt issuer not configured (COLLAB_JWT_SECRET unset or < 32 bytes) — /me + acl-gated routes disabled")
 	}
 
 	router := api.NewRouter(deps)
