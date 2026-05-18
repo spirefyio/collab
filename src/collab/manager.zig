@@ -1439,6 +1439,12 @@ pub const CollabManager = struct {
                         // CrdtBridge fairness sub-quota. Fall back to
                         // conn_peer_id, then zero.
                         const op_peer = extractLwwPeerId(plaintext) orelse conn_peer_id;
+                        // CONTRACT: asserted CROSS-REPO by studio/tests/crdt-share-test.sh
+                        // REPLICATION=manual (regex 'collab: inbound op \(unified-model\)
+                        // → bridge.applyPeerOp payload_len=[0-9]+'). The studio smoke
+                        // greps this exact string from collab's log output. Do not
+                        // rename 'inbound op' or remove 'payload_len=' without coordinating
+                        // a studio test update.
                         std.log.info(
                             "collab: inbound op (unified-model) → bridge.applyPeerOp payload_len={d}",
                             .{plaintext.len},
