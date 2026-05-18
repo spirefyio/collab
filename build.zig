@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
     const compat_mod = desktop_dep.module("compat");
     const util_json_mod = desktop_dep.module("util_json");
 
+    const identity_mod = b.addModule("identity", .{
+        .root_source_file = b.path("src/identity/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    identity_mod.addImport("compat", compat_mod);
+
     const collab_mod = b.addModule("collab", .{
         .root_source_file = b.path("src/collab/lib.zig"),
         .target = target,
@@ -26,6 +33,7 @@ pub fn build(b: *std.Build) void {
     collab_mod.addImport("zora", zora_mod);
     collab_mod.addImport("compat", compat_mod);
     collab_mod.addImport("util_json", util_json_mod);
+    collab_mod.addImport("identity", identity_mod);
 
     const collab_test_mod = b.createModule(.{
         .root_source_file = b.path("src/collab/lib.zig"),
@@ -36,6 +44,7 @@ pub fn build(b: *std.Build) void {
     collab_test_mod.addImport("zora", zora_mod);
     collab_test_mod.addImport("compat", compat_mod);
     collab_test_mod.addImport("util_json", util_json_mod);
+    collab_test_mod.addImport("identity", identity_mod);
 
     const collab_tests = b.addTest(.{
         .name = "collab-tests",

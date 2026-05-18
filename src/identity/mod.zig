@@ -39,13 +39,9 @@
 //! design (no timing oracle for the secret). Well-vetted in std.crypto.
 //! No external dependency, pure Zig.
 //!
-//! ## Module layout (current scope-tightening)
-//!
-//! Lives under `src/collab/` for B1 because identity is consumed ONLY by
-//! the collab module today. When B2 (Team) lands and introduces external
-//! account binding, this should be promoted to a top-level `src/identity/`
-//! module per the plan file. The current placement keeps build.zig
-//! diff-free while the API is still settling.
+//! Promoted from `src/collab/identity.zig` in T1.2 (2026-05-17).
+//! Now consumed by studio's `AuthProvider` contract via the
+//! `identity` module exported in `collab/build.zig`.
 
 const std = @import("std");
 const compat = @import("compat");
