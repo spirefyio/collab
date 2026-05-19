@@ -91,7 +91,7 @@
 
 const std = @import("std");
 const channel_mod = @import("channel.zig");
-const identity_mod = @import("identity.zig");
+const identity_mod = @import("identity");
 
 /// Wire protocol version emitted by this build.
 pub const PROTOCOL_VERSION: u32 = 4;
