@@ -124,7 +124,7 @@ jobs:
 
       - name: zig build test (fork local siblings)
         working-directory: collab
-        run: zig build test -Dllama_cpp=false --summary all --fork=../zora --fork=../ai --fork=../desktop
+        run: zig build test --summary all --fork=../zora --fork=../ai --fork=../desktop
 
       # ── Artifact manifest (for verify.sh local↔CI comparison) ──
       - name: Generate artifact manifest
