@@ -120,7 +120,7 @@ jobs:
       # deps resolve to the same forks). No token is ever handed to Zig.
       - name: zig build (fork local siblings)
         working-directory: collab
-        run: zig build -Dllama_cpp=false --fork=../zora --fork=../ai --fork=../desktop
+        run: zig build --fork=../zora --fork=../ai --fork=../desktop
 
       - name: zig build test (fork local siblings)
         working-directory: collab
