@@ -105,8 +105,12 @@ jobs:
         run: zig version
 
       # collab pulls desktop, whose default (react) GUI flavor links GTK + WebKit.
+      # `apt-get update` first: the runner image ships stale package lists and the
+      # Zig-install step no longer runs one (it used to piggyback on the removed
+      # minisign apt step), so without this the .deb fetch 404s on superseded versions.
       - name: Install system deps (GTK + WebKit)
         run: |
+          sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config
 
       # ── Build + test against the LOCAL forked siblings ──
