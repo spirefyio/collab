@@ -19,9 +19,13 @@ on:
 
 env:
   ZIG_VERSION: "0.16.0"
-  # Zig's release-signing public key (published at https://ziglang.org/download/).
-  # Treat any change as a supply-chain event. Mirrors ai/build-matrix.yml.
-  ZIG_MINISIGN_PUBKEY: "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+  # SHA-256 of the official zig-x86_64-linux-<ver> release tarball, pinned from
+  # ziglang.org's signed download index. This is the toolchain trust anchor: the
+  # value lives in THIS repo (it is NOT fetched from ziglang.org at build time),
+  # so a compromised ziglang.org/CDN cannot make a tampered tarball pass. It is
+  # checked with the runner's built-in sha256sum — no third-party verifier tool.
+  # Update in lockstep with ZIG_VERSION (value from ziglang.org/download/index.json).
+  ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
 
 # Lock the injected GITHUB_TOKEN to read-only. The private sibling checkouts
 # below use secrets.SPIREFYIO_PAT (a separate fine-grained PAT scoped to
@@ -78,21 +82,18 @@ jobs:
           path: desktop
           persist-credentials: false
 
-      # ── Install Zig 0.16 (signature-verified) ──
-      - name: Install minisign
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends minisign
-
-      - name: Download Zig + signature
+      # ── Install Zig 0.16 (checksum-verified, no third-party verifier tool) ──
+      # The tarball is checked against the pinned ZIG_SHA256 (env, above) with the
+      # runner's built-in sha256sum. The pinned hash lives in this repo, so a
+      # compromised ziglang.org/CDN cannot serve a tampered compiler that passes.
+      - name: Download Zig
         run: |
           BASE="https://ziglang.org/download/${ZIG_VERSION}"
           TARBALL="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           curl -fsSL --retry 3 --retry-delay 5 "$BASE/$TARBALL" -o zig.tar.xz
-          curl -fsSL --retry 3 --retry-delay 5 "$BASE/$TARBALL.minisig" -o zig.tar.xz.minisig
 
-      - name: Verify Zig signature
-        run: minisign -Vm zig.tar.xz -P "$ZIG_MINISIGN_PUBKEY"
+      - name: Verify Zig checksum
+        run: echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
 
       - name: Extract Zig and add to PATH
         run: |
