@@ -12,13 +12,18 @@
         // package name. A bare `zig build` (no fork) resolves these URLs from
         // GitHub instead (needs network + a token for private repos) — that is
         // the published-consumer path. Re-pin at publish time.
+        // SINGLE-ZORA-INSTANCE LOCKSTEP: the `collab` module pulls zora + desktop
+        // directly (build.zig:58-60), and studio consumes collab alongside its own
+        // direct zora/desktop deps. Zig keys a package by its declared hash, so
+        // these MUST match studio's pins (zora 62833a4 / desktop 88aab10) or the
+        // shared zora/compat/util_json modules fork. Bump in lockstep with studio.
         .zora = .{
-            .url = "git+https://github.com/spirefyio/zora.git#60264008a9a9cc165288daec83f8d1ecd4488993",
-            .hash = "zora-0.1.0-ay-7a64xLQAb-f1bbnToHJkzrg4LKLWwWzgDxCG9ZeEt",
+            .url = "git+https://github.com/spirefyio/zora.git#62833a4bd2a9c8f67fc53735cf5240607b8f0e03",
+            .hash = "zora-0.1.0-ay-7a9JvMAA_P2GLkXS691jCGjKc3QIvV-xeQvGnBBJK",
         },
         .desktop = .{
-            .url = "git+https://github.com/spirefyio/desktop.git#7db22d61c1fbb352a4954c11012f1bad1fe704a1",
-            .hash = "desktop-0.1.0-Qv2xinnrHQAALKlM41hFL41CwKTwEKdYrPssIyU4qpM-",
+            .url = "git+https://github.com/spirefyio/desktop.git#88aab10f1ecd25966d45bccc50fe1e30aff89b0a",
+            .hash = "desktop-0.1.0-Qv2xivQANACu7DoidqS-oisI278jV2C46IwGSkYUEWmW",
         },
     },
 
