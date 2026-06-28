@@ -18,12 +18,12 @@
         // these MUST match studio's pins (zora 62833a4 / desktop 88aab10) or the
         // shared zora/compat/util_json modules fork. Bump in lockstep with studio.
         .zora = .{
-            .url = "git+https://github.com/spirefyio/zora.git#62833a4bd2a9c8f67fc53735cf5240607b8f0e03",
-            .hash = "zora-0.1.0-ay-7a9JvMAA_P2GLkXS691jCGjKc3QIvV-xeQvGnBBJK",
+            .url = "git+https://github.com/spirefyio/zora.git#fcaa6475e233aa3e9e6ab83fbf3857e4b7bf9830",
+            .hash = "zora-0.1.0-ay-7a4EfQAC4sIp6jz2YLcPPg-snkjv-zZxQ24LTNS5E",
         },
         .desktop = .{
-            .url = "git+https://github.com/spirefyio/desktop.git#88aab10f1ecd25966d45bccc50fe1e30aff89b0a",
-            .hash = "desktop-0.1.0-Qv2xivQANACu7DoidqS-oisI278jV2C46IwGSkYUEWmW",
+            .url = "git+https://github.com/spirefyio/desktop.git#1f7e27b3ce5c42df9a5fdc1a970f3f4001d435d4",
+            .hash = "desktop-0.1.0-Qv2xikYMNADLGCInXs7Qvm9nwpV2WQZAT0aPXhxB8ozr",
         },
     },
 
