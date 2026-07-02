@@ -5,25 +5,19 @@
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
-        // Pinned to the publishable siblings on `dev` (the release-candidate
-        // line). Local dev + CI override these with your working copies via
-        // `./scripts/dev.sh` (which passes --fork=<sibling>); Zig matches a
-        // fork by package name, so the pinned hash's name MUST equal the local
-        // package name. A bare `zig build` (no fork) resolves these URLs from
-        // GitHub instead (needs network + a token for private repos) — that is
-        // the published-consumer path. Re-pin at publish time.
-        // SINGLE-ZORA-INSTANCE LOCKSTEP: the `collab` module pulls zora + desktop
-        // directly (build.zig:58-60), and studio consumes collab alongside its own
-        // direct zora/desktop deps. Zig keys a package by its declared hash, so
-        // these MUST match studio's pins (zora 62833a4 / desktop 88aab10) or the
-        // shared zora/compat/util_json modules fork. Bump in lockstep with studio.
+        // Sibling workspace deps: resolved from the local ../zora and ../desktop
+        // checkouts (their current dev/main). Path deps carry no hash, so there is
+        // no pin to bump and no cross-repo lockstep. collab pulls zora + desktop
+        // directly, and studio consumes collab alongside its own zora + desktop;
+        // all resolve to the same ../zora and ../desktop directories, so the
+        // shared modules dedupe. Repos live side-by-side under $ZORA_ROOT. To
+        // publish, swap these back to url+hash pins (git history has the last
+        // pinned form).
         .zora = .{
-            .url = "git+https://github.com/spirefyio/zora.git#284a6187a101660c63380d5d1e4e4af4fd984bc1",
-            .hash = "zora-0.1.0-ay-7a6FRQgClFsw-1TcAjBxIRhi3jYT23S_kkH4FX-mj",
+            .path = "../zora",
         },
         .desktop = .{
-            .url = "git+https://github.com/spirefyio/desktop.git#70a5f2f6e522a5e64cc8c75782269aeabe415f50",
-            .hash = "desktop-0.1.0-Qv2ximJ1NAAU-BGi6aMExUR3RwTcPnKcswF0hVxAYJzf",
+            .path = "../desktop",
         },
     },
 
