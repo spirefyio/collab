@@ -104,7 +104,10 @@ jobs:
       - name: Verify Zig
         run: zig version
 
-      # collab pulls desktop, whose default (react) GUI flavor links GTK + WebKit.
+      # collab pulls desktop; since the M1.0 flip the default flavor is NATIVE,
+      # which links GTK only (host file dialogs) — so the bare cells below now
+      # exercise the native substrate. WebKit dev stays installed so an explicit
+      # -Dgui=react build keeps working here without a workflow change.
       # `apt-get update` first: the runner image ships stale package lists and the
       # Zig-install step no longer runs one (it used to piggyback on the removed
       # minisign apt step), so without this the .deb fetch 404s on superseded versions.

@@ -12,15 +12,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // GUI flavor passthrough — see the `Gui` doc comment. Defaults to react, so
-    // collab's standalone build and existing react consumers are unchanged.
+    // GUI flavor passthrough — see the `Gui` doc comment. Defaults to native
+    // since the M1.0 ecosystem flip (desktop dev@850640e, studio commit 4/4),
+    // so a bare collab build matches what every consumer builds by default;
+    // react consumers forward -Dgui=react explicitly (the frozen escape hatch).
     const gui = b.option(
         Gui,
         "gui",
-        "GUI flavor forwarded to the desktop dependency (default: react). collab " ++
+        "GUI flavor forwarded to the desktop dependency (default: native). collab " ++
             "is GUI-agnostic; this only keeps the shared desktop instance deduped " ++
             "with the consuming app.",
-    ) orelse .react;
+    ) orelse .native;
 
     const zora_dep = b.dependency("zora", .{
         .target = target,
