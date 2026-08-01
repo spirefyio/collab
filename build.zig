@@ -9,6 +9,19 @@ const std = @import("std");
 const Gui = enum { react, vue, svelte, native, none };
 
 pub fn build(b: *std.Build) void {
+
+    // --- build stamp (Help -> About) -----------------------------------
+    // CANONICAL COPY: desktop/build.zig (build.zig cannot import helpers
+    // across packages) — edit there first, then mirror here. Every
+    // `zig build` increments the gitignored per-machine counter; the app
+    // aggregates each repo's `dep.module("stamp")` into the About dialog.
+    const stamp_opts = b.addOptions();
+    stamp_opts.addOption([]const u8, "module_name", stampName());
+    stamp_opts.addOption([]const u8, "version", stampVersion());
+    stamp_opts.addOption(u64, "build_number", stampBuildNumber(b));
+    stamp_opts.addOption(i64, "built_epoch_s", stampEpoch(b));
+    stamp_opts.addOption([]const u8, "built_on", stampHost(b));
+    _ = b.addModule("stamp", .{ .root_source_file = stamp_opts.getOutput() });
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -80,4 +93,49 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run collab tests");
     test_step.dependOn(&b.addRunArtifact(collab_tests).step);
+}
+
+// --- build-stamp helpers (canonical copy: desktop/build.zig) ----------------
+
+/// The package name from `build.zig.zon` — besides being useful, it makes
+/// each repo's generated stamp file UNIQUE: with identical versions, counter
+/// values and build second, the content-addressed cache deduped two repos'
+/// stamps into ONE file and the compiler refused it as belonging to two
+/// modules.
+fn stampName() []const u8 {
+    const manifest = @embedFile("build.zig.zon");
+    const key = ".name = .";
+    const at = std.mem.indexOf(u8, manifest, key) orelse return "unknown";
+    const rest = manifest[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse return "unknown";
+    return rest[0..end];
+}
+
+fn stampVersion() []const u8 {
+    const manifest = @embedFile("build.zig.zon");
+    const key = ".version = \"";
+    const at = std.mem.indexOf(u8, manifest, key) orelse return "0.0.0";
+    const rest = manifest[at + key.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return "0.0.0";
+    return rest[0..end];
+}
+
+fn stampBuildNumber(b: *std.Build) u64 {
+    // ABSOLUTE path: `b.run` inherits the TOP-LEVEL build's cwd, so a
+    // dependency stamping "./.build-number" would increment the parent app's
+    // counter instead of its own (observed: studio at 5, zora at none).
+    const counter = b.pathFromRoot(".build-number");
+    const cmd = b.fmt("n=$(cat '{s}' 2>/dev/null || echo 0); n=$((n+1)); printf %s \"$n\" > '{s}'; printf %s \"$n\"", .{ counter, counter });
+    const out = b.run(&.{ "sh", "-c", cmd });
+    return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \t\r\n"), 10) catch 0;
+}
+
+fn stampEpoch(b: *std.Build) i64 {
+    const out = b.run(&.{ "date", "+%s" });
+    return std.fmt.parseInt(i64, std.mem.trim(u8, out, " \t\r\n"), 10) catch 0;
+}
+
+fn stampHost(b: *std.Build) []const u8 {
+    const out = b.run(&.{ "hostname", "-s" });
+    return std.mem.trim(u8, out, " \t\r\n");
 }
