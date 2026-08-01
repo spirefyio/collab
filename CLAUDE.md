@@ -2,7 +2,7 @@
 
 ## Code Review Discipline (Spirefy Engineering Standard)
 
-The full discipline — the North Star prime directive, the 6 mandatory + 4
+The full discipline — the North Star prime directive, the mandatory +
 expansion lens panel, the Goal-Conformance Brief, the Precision Counterweight,
 the pre-panel consumer-grep gate, the sibling-class hunt, the
 deferred-disposition audit, and the acceptance gate — is the **single source of
