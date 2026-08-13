@@ -2410,12 +2410,26 @@ fn extractLwwPeerId(op_bytes: []const u8) ?[16]u8 {
 // URL Parsing Helper
 // =============================================================================
 
-const HostPort = struct {
+pub const HostPort = struct {
     host: []const u8,
     port: u16,
 };
 
-fn parseWsUrl(url: []const u8) ?HostPort {
+/// Split a `ws://` / `wss://` relay URL into the host and port a connect will use.
+///
+/// PUBLIC because the egress ACL in `host_functions.zig` has to authorize the same
+/// host this hands to `ws.connect`. A second parser there would be a decision made
+/// about one string and an action taken on another — the classic
+/// check-here-connect-there divergence — so there is one parser and both callers
+/// use it.
+///
+/// Returns null for anything it cannot reduce to a usable host. That now includes
+/// an EMPTY host and one containing userinfo (`@`), neither of which it used to
+/// reject: `ws://` alone parsed to an empty host, and `ws://evil.test@ok.test/`
+/// parsed to the host `evil.test@ok.test`, which an allow-list comparing text
+/// would judge as neither while a connect would resolve as one of them. Both are
+/// refusals rather than guesses.
+pub fn parseWsUrl(url: []const u8) ?HostPort {
     // Parse ws://host:port or wss://host:port
     var rest = url;
     if (std.mem.startsWith(u8, rest, "ws://")) {
@@ -2431,14 +2445,20 @@ fn parseWsUrl(url: []const u8) ?HostPort {
         rest = rest[0..slash];
     }
 
+    // Userinfo makes "which host is this" ambiguous between a text matcher and a
+    // resolver. No relay needs it; refuse rather than pick an interpretation.
+    if (std.mem.indexOfScalar(u8, rest, '@') != null) return null;
+
     // Split host:port
     if (std.mem.lastIndexOf(u8, rest, ":")) |colon| {
         const host = rest[0..colon];
+        if (host.len == 0) return null;
         const port_str = rest[colon + 1 ..];
         const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
         return .{ .host = host, .port = port };
     }
 
+    if (rest.len == 0) return null;
     // No port specified — default 8080
     return .{ .host = rest, .port = 8080 };
 }
@@ -2474,6 +2494,27 @@ test "parseWsUrl: wss scheme" {
 test "parseWsUrl: invalid" {
     try std.testing.expect(parseWsUrl("http://example.com") == null);
     try std.testing.expect(parseWsUrl("not a url") == null);
+}
+
+test "PLANT: parseWsUrl refuses the shapes an allow-list cannot judge (#112)" {
+    // An EMPTY host used to parse successfully and reach `ws.connect`. There is
+    // no allow-list entry that can match "", so it could only ever have been
+    // approved by a check that was not happening.
+    try std.testing.expect(parseWsUrl("ws://") == null);
+    try std.testing.expect(parseWsUrl("wss://") == null);
+    try std.testing.expect(parseWsUrl("ws:///path") == null);
+    try std.testing.expect(parseWsUrl("ws://:8080") == null);
+
+    // Userinfo is the ambiguity that matters: `ws://evil.test@ok.test/` used to
+    // yield the host `evil.test@ok.test`, which a text matcher judges as neither
+    // of the two names in it while a resolver connects to exactly one. Refused
+    // rather than interpreted — no relay needs userinfo.
+    try std.testing.expect(parseWsUrl("ws://evil.test@ok.test") == null);
+    try std.testing.expect(parseWsUrl("ws://user:pass@relay.example.com:9090") == null);
+
+    // Still accepted, so the guard above did not cost the ordinary cases.
+    try std.testing.expectEqualStrings("relay.example.com", parseWsUrl("ws://relay.example.com").?.host);
+    try std.testing.expectEqualStrings("10.0.0.4", parseWsUrl("wss://10.0.0.4:443/ws").?.host);
 }
 
 test "CollabManager: init and deinit" {
