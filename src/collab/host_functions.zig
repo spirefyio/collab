@@ -94,6 +94,7 @@ pub fn setGlobalContext(allocator: std.mem.Allocator, manager: *CollabManager) v
 /// starts, for the same reason `setGlobalContext` must.
 pub fn setEgressGate(gate: ?*const zora.pe.host.EgressGate) void {
     global_egress_gate = gate;
+    warned_gate_absent = false;
 }
 
 /// Get the 7 host function definitions for registration with the engine.
@@ -201,9 +202,29 @@ fn callerId(caller_ptr: [*c]const u8, caller_len: usize) ?[]const u8 {
 fn egressAllowed(plugin_id: []const u8, host: []const u8) bool {
     if (host.len == 0) return false;
     if (std.mem.indexOfScalar(u8, host, '%') != null) return false;
-    const gate = global_egress_gate orelse return false;
+    const gate = global_egress_gate orelse {
+        // ABSENT is not BROKEN, and the two must not look alike — the same
+        // distinction desktop's path-policy slot draws. A missing gate denies
+        // (correct), but silently it reads to a plugin author as "collab is
+        // broken" and to an integrator as "collab has no egress control". Say
+        // which it is, once, at `warn`: an app that meant to install a gate
+        // finds out, and one that did not learns collab is inert by design.
+        if (!warned_gate_absent) {
+            warned_gate_absent = true;
+            std.log.warn(
+                "collab: no egress gate installed — every plugin-driven join will be REFUSED. " ++
+                    "The host app must call `setEgressGate` before the engine starts.",
+                .{},
+            );
+        }
+        return false;
+    };
     return gate.checkHost(gate.ctx, plugin_id, host);
 }
+
+/// Whether the absent-gate warning has been emitted. Racy by construction and
+/// harmless: the worst outcome is two identical warnings.
+var warned_gate_absent: bool = false;
 
 const unidentified = "collab requires an identified caller";
 
@@ -678,4 +699,23 @@ test "a percent-encoded or empty host is refused BEFORE the gate is consulted" {
     try testing.expect(!egressAllowed("p", "evil%2eexample.com"));
     try testing.expect(!egressAllowed("p", ""));
     try testing.expectEqual(@as(usize, 0), FakeGate.call_count);
+}
+
+test "PLANT: an absent gate warns ONCE, and installing one re-arms the warning" {
+    // The absent/broken distinction, asserted rather than assumed. A missing
+    // gate must deny AND say so — silently denying is how "collab is inert by
+    // design" gets mistaken for "collab is broken" for a whole afternoon.
+    setEgressGate(null);
+    warned_gate_absent = false;
+    defer setEgressGate(null);
+
+    try testing.expect(!egressAllowed("p", "relay.example.com"));
+    try testing.expect(warned_gate_absent); // said it
+    try testing.expect(!egressAllowed("p", "relay.example.com"));
+    try testing.expect(warned_gate_absent); // and did not say it again
+
+    // Installing a gate re-arms, so a later teardown warns afresh rather than
+    // staying quiet because a previous process phase already had its say.
+    installFakeGate("relay.example.com");
+    try testing.expect(!warned_gate_absent);
 }
