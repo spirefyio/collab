@@ -205,17 +205,27 @@ pub const Session = struct {
         } else {
             self.room_code = crypto_mod.generateRoomCode();
         }
+        // #387 (gate CRITICAL-6), the same free-before-dupe class #382 C-2 was
+        // supposed to eradicate — it closed the CRDT copy and missed both
+        // session copies. Allocate the replacement FIRST. The old order left
+        // `relay_url` pointing at freed memory with a non-zero length whenever
+        // the dupe OOM'd, and `deinit` then freed it a second time.
+        //
+        // Ordering matters twice over: the fallible allocation also runs before
+        // any session state is committed, so an OOM leaves the session `.idle`
+        // rather than half-transitioned into `.hosting` with no URL.
+        var url_buf: [64]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "ws://0.0.0.0:{d}", .{port}) catch return error.InternalError;
+        const owned_url = try self.allocator.dupe(u8, url);
+
         self.salt = crypto_mod.generateSalt();
         self.suite = suite;
         self.crypto = crypto_mod.CryptoContext.init(suite, &self.room_code, self.salt);
         self.mode = .host;
         self.state = .hosting;
 
-        // Generate relay URL from local IP
-        var url_buf: [64]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "ws://0.0.0.0:{d}", .{port}) catch return error.InternalError;
         if (self.relay_url.len > 0) self.allocator.free(self.relay_url);
-        self.relay_url = try self.allocator.dupe(u8, url);
+        self.relay_url = owned_url;
 
         std.log.info(
             "collab: Hosting session, room={s} port={d} suite={s}",
@@ -233,6 +243,15 @@ pub const Session = struct {
         if (self.state != .idle) return error.InvalidStateTransition;
 
         if (room_code.len != 9) return error.InvalidRoomCode;
+
+        // #387 (gate CRITICAL-6), sibling of the `startHosting` copy above, and
+        // strictly worse here: `relay_url` is a CALLER-supplied slice, so
+        // `session.startJoining(code, session.relay_url)` — a natural way to
+        // spell "reconnect to the same relay" — freed the source and then read
+        // it back. Duplicating first fixes the dangling field, the double free
+        // on `deinit`, the half-committed transition, AND the aliasing read.
+        const owned_url = try self.allocator.dupe(u8, relay_url);
+
         @memcpy(&self.room_code, room_code[0..9]);
         // Salt is zero placeholder until welcome arrives. `crypto` stays
         // null — do NOT derive a key from the zero salt (pre-pv:3 the
@@ -245,9 +264,11 @@ pub const Session = struct {
         self.state = .joining;
 
         if (self.relay_url.len > 0) self.allocator.free(self.relay_url);
-        self.relay_url = try self.allocator.dupe(u8, relay_url);
+        self.relay_url = owned_url;
 
-        std.log.info("collab: Joining session, room={s} relay={s} (awaiting welcome)", .{ self.room_code, relay_url });
+        // Log the OWNED copy, not the caller's slice: in the aliasing case the
+        // caller's `relay_url` is exactly what the free above just released.
+        std.log.info("collab: Joining session, room={s} relay={s} (awaiting welcome)", .{ self.room_code, self.relay_url });
     }
 
     /// Install the host-provided session salt + suite and initialize the
@@ -386,6 +407,15 @@ pub const Session = struct {
         // Security panel M-2: zero salt + room_code parallel to crypto.deinit.
         std.crypto.secureZero(u8, &self.salt);
         std.crypto.secureZero(u8, &self.room_code);
+        // #387 (gate CRITICAL-6, second half): release the relay URL on the way
+        // back to idle, exactly as `leaveSession` does. Both are "return this
+        // session to idle" transitions and they should not disagree about what
+        // idle means — an errored session that still advertises a relay URL is
+        // a state no reader expects.
+        if (self.relay_url.len > 0) {
+            self.allocator.free(self.relay_url);
+            self.relay_url = "";
+        }
         self.state = .idle;
         std.log.warn("collab: Session error: {s}", .{msg});
     }
@@ -740,4 +770,63 @@ test "Session: toJson produces valid JSON" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"connected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "Bob") != null);
+}
+
+// =============================================================================
+// #387 WITNESS — gate CRITICAL-6
+// =============================================================================
+
+test "#387 C-6 WITNESS: startJoining survives being handed its OWN relay_url" {
+    // The aliasing half. `free(self.relay_url)` used to run before
+    // `dupe(relay_url)`, so passing the session's own URL back in — the natural
+    // way to spell "reconnect to the same relay" — freed the source and then
+    // read it. Under the testing allocator that is a use-after-free, so this is
+    // a memory-safety measurement rather than a shape assertion.
+    const allocator = std.testing.allocator;
+
+    var s = Session.init(allocator);
+    defer s.deinit();
+
+    try s.startJoining("TEST-0001", "ws://relay.example:9000");
+    const first = s.relay_url;
+
+    s.state = .idle;
+    try s.startJoining("TEST-0002", first); // <-- aliases s.relay_url
+
+    std.debug.print(
+        "\n  #387 C-6: aliased startJoining ok — relay={s} room={s}\n",
+        .{ s.relay_url, s.room_code },
+    );
+    try std.testing.expectEqualStrings("ws://relay.example:9000", s.relay_url);
+}
+
+test "#387 C-6 WITNESS: an OOM on the URL dupe leaves NO dangling field to double-free" {
+    // The decisive half is silent: `deinit` below must free `relay_url` exactly
+    // once. Under the old order the failed dupe left a freed pointer with a
+    // non-zero length in the field, and teardown freed it a second time.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+
+    var s = Session.init(alloc);
+    defer s.deinit();
+
+    try s.startHosting(9000, "TEST-0001", .aes_gcm_v1);
+    const before = s.relay_url;
+    try std.testing.expect(before.len > 0);
+
+    // Arm the next allocation to fail — on this path that is the URL dupe.
+    s.state = .idle;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, s.startHosting(9001, "TEST-0002", .aes_gcm_v1));
+    try std.testing.expect(failing.has_induced_failure);
+
+    std.debug.print(
+        "  #387 C-6: after the refused retry, relay={s} state={s} (unchanged, still readable)\n",
+        .{ s.relay_url, @tagName(s.state) },
+    );
+
+    // The old URL is still live AND still owned — readable here, freed once by
+    // `deinit`. And the session never entered `.hosting` on a failed setup.
+    try std.testing.expectEqualStrings(before, s.relay_url);
+    try std.testing.expectEqual(SessionState.idle, s.state);
 }

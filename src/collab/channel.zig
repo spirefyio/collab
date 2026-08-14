@@ -55,6 +55,33 @@ pub const LocalOpFn = *const fn (ctx: *anyopaque, op_bytes: OpBytes) void;
 /// Implementations MUST NOT block long or re-enter `CollabManager`.
 pub const RemoteOpFn = *const fn (ctx: *anyopaque, peer_id: [16]u8, op_bytes: OpBytes) void;
 
+// -----------------------------------------------------------------------------
+// #387 (gate MED-18): an observer is ONE optional value, not two.
+//
+// The callback and its context used to be independent `?` fields on both
+// `Channel` and `ChannelSpec`, and `register` copied whatever combination it was
+// handed. A spec with a callback and a default-null context therefore registered
+// cleanly and then panicked on `ctx.?` at the FIRST delivery — a crash that
+// cannot be reached until a peer sends something, in a code path that runs
+// while holding `CollabManager.mutex`.
+//
+// Pairing them removes the state rather than validating it: there is no way to
+// spell "callback without context" any more, so `register` needs no check and
+// no error, and the delivery sites need no `.?`.
+// -----------------------------------------------------------------------------
+
+/// A local-op observer and the context it is invoked with.
+pub const LocalObserver = struct {
+    callback: LocalOpFn,
+    ctx: *anyopaque,
+};
+
+/// A remote-op observer and the context it is invoked with.
+pub const RemoteObserver = struct {
+    callback: RemoteOpFn,
+    ctx: *anyopaque,
+};
+
 /// One CRDT type registered with a CollabManager. Channels are
 /// heap-allocated by the registry; consumers receive stable `*Channel`
 /// pointers from `find()` valid for the lifetime of the registry.
@@ -88,12 +115,10 @@ pub const Channel = struct {
 
     /// Optional local-op observer (typically the channel's host-side
     /// bridge to wire ops into the model actor).
-    on_local_op: ?LocalOpFn = null,
-    on_local_op_ctx: ?*anyopaque = null,
+    on_local_op: ?LocalObserver = null,
 
     /// Optional remote-op observer.
-    on_remote_op: ?RemoteOpFn = null,
-    on_remote_op_ctx: ?*anyopaque = null,
+    on_remote_op: ?RemoteObserver = null,
 };
 
 /// Registration spec passed to `ChannelRegistry.register`. Mirrors the
@@ -105,10 +130,8 @@ pub const ChannelSpec = struct {
     writable_by_local: bool = false,
     writable_by_peers: bool = false,
     allowed_plugin_ids: []const []const u8 = &.{},
-    on_local_op: ?LocalOpFn = null,
-    on_local_op_ctx: ?*anyopaque = null,
-    on_remote_op: ?RemoteOpFn = null,
-    on_remote_op_ctx: ?*anyopaque = null,
+    on_local_op: ?LocalObserver = null,
+    on_remote_op: ?RemoteObserver = null,
 };
 
 /// Errors raised by registry operations.
@@ -213,9 +236,7 @@ pub const ChannelRegistry = struct {
             .writable_by_peers = spec.writable_by_peers,
             .allowed_plugin_ids = spec.allowed_plugin_ids,
             .on_local_op = spec.on_local_op,
-            .on_local_op_ctx = spec.on_local_op_ctx,
             .on_remote_op = spec.on_remote_op,
-            .on_remote_op_ctx = spec.on_remote_op_ctx,
         };
 
         try self.slots.append(ch);

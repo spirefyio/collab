@@ -565,7 +565,7 @@ pub const CollabManager = struct {
         const queue = try SendQueue.init(self.allocator, SendQueue.DEFAULT_CAPACITY);
         errdefer queue.deinit();
 
-        // pv:3: `startJoining` does NOT take a salt — the joiner stays
+        // pv:4: `startJoining` does NOT take a salt — the joiner stays
         // crypto-null until the host's `welcome` envelope arrives. From
         // here on, errors must roll back the session state machine
         // (state .joining → .idle, clear relay_url).
@@ -723,13 +723,24 @@ pub const CollabManager = struct {
         defer self.allocator.free(ops);
 
         // Encode each op to op_bytes for the wire envelope.
+        //
+        // #387 (gate CRITICAL-5): `alloc` returns UNINITIALIZED memory, and the
+        // cleanup below used to free every element of the whole slice. The loop
+        // that fills them is fallible, so any mid-loop OOM sent `free` at
+        // whatever undefined pointers happened to be in the tail — heap
+        // corruption from an allocation failure.
+        //
+        // `produced` bounds the cleanup to the prefix that actually holds
+        // pointers. This is the pattern the reserve/snapshot paths in this file
+        // already use; this site was the one that did not.
         const op_bytes_batch = try self.allocator.alloc([]const u8, ops.len);
+        var produced: usize = 0;
         defer {
-            for (op_bytes_batch) |b| self.allocator.free(b);
+            for (op_bytes_batch[0..produced]) |b| self.allocator.free(b);
             self.allocator.free(op_bytes_batch);
         }
-        for (ops, 0..) |op, i| {
-            op_bytes_batch[i] = try crdt_mod.encodeOpBytes(self.allocator, op);
+        while (produced < ops.len) : (produced += 1) {
+            op_bytes_batch[produced] = try crdt_mod.encodeOpBytes(self.allocator, ops[produced]);
         }
         try self.broadcastChannelOps("unified-model", op_bytes_batch);
         self.pushState();
@@ -770,8 +781,8 @@ pub const CollabManager = struct {
         // this to mirror the local change into the host application's
         // model layer when their flow doesn't already go through the
         // CRDT directly. Borrowed slice for the call duration.
-        if (ch.on_local_op) |cb| {
-            cb(ch.on_local_op_ctx.?, op_bytes);
+        if (ch.on_local_op) |obs| {
+            obs.callback(obs.ctx, op_bytes);
         }
 
         self.pushState();
@@ -1064,7 +1075,7 @@ pub const CollabManager = struct {
                     };
                 }
 
-                // pv:3 host-side path: ONLY hosts send `welcome`. Guest
+                // pv:4 host-side path: ONLY hosts send `welcome`. Guest
                 // peers in a relayed-join scenario don't need welcome
                 // (they already negotiated theirs with the host during
                 // their own join).
@@ -1143,7 +1154,23 @@ pub const CollabManager = struct {
                 // For v1 there is exactly ONE channel (unified-model);
                 // future builds with editor-text / blob channels send
                 // one sync envelope per channel.
-                self.sendChannelSyncs(from_conn_idx);
+                //
+                // #387 (gate CRITICAL-2), SEND half. HOSTS ONLY. This call used
+                // to be unconditional, and the honest path was the dangerous
+                // one: the host relays a new peer's `join` to everyone, and
+                // every recipient answered it with a snapshot. A guest's
+                // "recipient" is its host connection, so a stale guest shipped
+                // its own state to the host on every third-party join — no
+                // crafted sequence, no hostile peer, just two people and a
+                // reconnect.
+                //
+                // Note `sendChannelSyncs`'s own header claimed it "is only
+                // called from the host's .join handler anyway". That was false
+                // when written; it is true now, and this is the line that makes
+                // it true.
+                if (self.session.mode == .host) {
+                    self.sendChannelSyncs(from_conn_idx);
+                }
 
                 // Broadcast updated peer list to all
                 self.pushPeers();
@@ -1157,7 +1184,7 @@ pub const CollabManager = struct {
                 }
             },
             .welcome => |wmsg| {
-                // pv:3 guest-side path: install the host's salt + the
+                // pv:4 guest-side path: install the host's salt + the
                 // negotiated suite, init crypto. Only guests should
                 // receive welcome — host receiving welcome is a wire
                 // bug (relay reflecting? Hostile peer?) and we drop it.
@@ -1248,6 +1275,39 @@ pub const CollabManager = struct {
                 std.log.info("collab: welcome applied (suite={s})", .{wmsg.suite});
             },
             .leave => |l| {
+                // #387 (gate HIGH-13): a `leave` frame is unauthenticated, and
+                // nothing tied the id it NAMES to the connection it arrived on.
+                // So any admitted peer could evict any other by naming its id —
+                // and eviction is not cosmetic: the victim's `peer_pubkeys`
+                // binding goes with it, so every subsequent signed op from that
+                // peer is dropped for failing the cross-check. A one-frame mute
+                // of an arbitrary participant.
+                //
+                // Same asymmetry as the sync arm. On the HOST the connection
+                // genuinely is the departing peer, so require the two to agree.
+                // On a GUEST the frame is a relay of someone else's departure
+                // and legitimately names a third party — but it may only come
+                // from the host connection.
+                if (self.session.mode == .host) {
+                    const conn_peer = if (from_conn_idx < self.connections.items.len)
+                        self.connections.items[from_conn_idx].peer_id
+                    else
+                        std.mem.zeroes([16]u8);
+                    if (!std.mem.eql(u8, &conn_peer, &l.peer_id)) {
+                        std.log.warn(
+                            "collab: refusing leave for {x} from conn[{d}] bound to {x} — a peer may only announce its own departure",
+                            .{ l.peer_id, from_conn_idx, conn_peer },
+                        );
+                        return;
+                    }
+                } else if (from_conn_idx != 0) {
+                    std.log.warn(
+                        "collab: refusing relayed leave from conn[{d}] — only the host connection relays departures",
+                        .{from_conn_idx},
+                    );
+                    return;
+                }
+
                 self.session.removePeer(l.peer_id);
                 // Panel #2 security HIGH-4: mirror session.removePeer with
                 // peer_pubkeys cleanup. Without this, the cross-check map
@@ -1268,6 +1328,48 @@ pub const CollabManager = struct {
                 }
             },
             .sync => |s| {
+                // #387 (gate CRITICAL-2), ACCEPT half — and this is the one
+                // that matters, because it is the only side an attacker does
+                // not control.
+                //
+                // `sync` is UNSIGNED by design in pv:4 (protocol.zig's header
+                // says so): the host's snapshot is the session-start seed, and
+                // per-op signatures carry authenticity from there. That
+                // reasoning holds ONLY if a snapshot can come from the host.
+                // Nothing checked. A guest — any admitted peer, holding only
+                // the room key — could hand the host a snapshot that replaced
+                // host state wholesale, and the replay below then attributed
+                // every field to the host itself (`null` signer, see the
+                // ReplayCtx callback).
+                //
+                // Two conditions, and both are needed. Host-mode never accepts
+                // a snapshot at all: the host IS the source of truth, so an
+                // inbound sync is always either a bug or an attack. A guest
+                // accepts only from `connections.items[0]`, which is where the
+                // guest's single host connection lives by construction (see the
+                // `connections` field comment) — a relayed frame from any other
+                // slot is not the host speaking.
+                //
+                // Snapshot signing remains the Tier-2 answer and is still worth
+                // having; this is the role check that should have been here
+                // regardless of whether the bytes are signed.
+                if (self.session.mode != .guest) {
+                    self.metrics.inbound_unsigned_dropped += 1;
+                    std.log.warn(
+                        "collab: refusing inbound sync on '{s}' — this peer is the HOST and does not adopt peer snapshots",
+                        .{s.ch},
+                    );
+                    return;
+                }
+                if (from_conn_idx != 0) {
+                    self.metrics.inbound_unsigned_dropped += 1;
+                    std.log.warn(
+                        "collab: refusing sync on '{s}' from conn[{d}] — only the host connection may seed this peer",
+                        .{ s.ch, from_conn_idx },
+                    );
+                    return;
+                }
+
                 // Channel-routed sync. Look up the channel by name and
                 // load the snapshot into its CRDT. Unknown channel →
                 // drop with a metric (closes quality-engineer C-3).
@@ -1280,7 +1382,7 @@ pub const CollabManager = struct {
                     return;
                 };
 
-                // pv:3: decrypt before handing to the CRDT (drops with
+                // pv:4: decrypt before handing to the CRDT (drops with
                 // metric if pre-welcome or AEAD tag fails).
                 const plaintext_snap = self.decryptInbound(s.ch, "sync", s.snapshot) orelse return;
                 defer self.allocator.free(plaintext_snap);
@@ -1484,8 +1586,8 @@ pub const CollabManager = struct {
                 // because no default channel registers one today. Unreachable
                 // is not the same as correct.
                 if (changed) {
-                    if (ch.on_remote_op) |cb| {
-                        cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                    if (ch.on_remote_op) |obs| {
+                        obs.callback(obs.ctx, conn_peer_id, plaintext);
                     }
                 }
 
@@ -1521,7 +1623,7 @@ pub const CollabManager = struct {
                     return;
                 }
 
-                // pv:3: pre-welcome gate (must check before per-entry
+                // pv:4: pre-welcome gate (must check before per-entry
                 // loop so we drop the entire batch, not just each entry).
                 if (self.session.crypto == null) {
                     self.metrics.inbound_missing_welcome += 1;
@@ -1633,17 +1735,8 @@ pub const CollabManager = struct {
                         continue;
                     }
 
-                    // Eligible for relay AFTER both checks passed.
-                    // applyRemote failures below do NOT block relay —
-                    // an op that fails THIS host's apply path may
-                    // still apply correctly at downstream peers
-                    // (e.g. version-skew tolerated by CRDT).
-                    verified_for_relay.appendAssumeCapacity(entry);
-
                     // Same pre-decode ordering as the `.op` arm. Per entry,
-                    // because each entry is its own op; an undecodable one is
-                    // dropped without applying (and still relays, matching the
-                    // apply-failure policy noted above).
+                    // because each entry is its own op.
                     const pre = preDecodeUnifiedModelOp(self, batch.ch, plaintext);
                     defer pre.deinit(self.allocator);
                     if (pre.isUndecodable()) continue;
@@ -1651,13 +1744,39 @@ pub const CollabManager = struct {
                     const changed = ch.crdt.applyRemote(plaintext) catch continue;
                     if (changed) any_changed = true;
 
+                    // #387 (gate HIGH-11): eligible for relay only AFTER this
+                    // host has actually applied it. RETRACTION of the rationale
+                    // that used to sit above the append — it read "an op that
+                    // fails THIS host's apply path may still apply correctly at
+                    // downstream peers (e.g. version-skew tolerated by CRDT)",
+                    // and it does not survive examination:
+                    //
+                    //  - There is no version skew to tolerate. Every peer runs
+                    //    the same decoder and the same merge rule; `pv` is
+                    //    checked for exact equality at the frame boundary.
+                    //  - The failures that ARE host-local are exactly the ones
+                    //    that must not relay. An OOM here made guests apply an
+                    //    op the authoritative host had dropped, with no
+                    //    anti-entropy pass to notice or repair it.
+                    //  - #386's forward-jump bound makes this sharper still:
+                    //    admission is now relative to each peer's clock, so
+                    //    peers CAN legitimately disagree. Relaying only what
+                    //    the host accepted is what keeps the host's accepted
+                    //    set the one every guest sees.
+                    //
+                    // Note `changed == false` still relays: a losing LWW merge
+                    // is a successful application, and the same op may win at a
+                    // peer whose state differs. Only a genuine failure to apply
+                    // — the `continue` above — withholds the relay.
+                    verified_for_relay.appendAssumeCapacity(entry);
+
                     if (pre.readyOp()) |op| {
                         dispatchUnifiedModelOp(self, changed, op, entry.signer, conn_peer_id);
                     }
                     // #382 M-1, batch sibling — same gate, same reason.
                     if (changed) {
-                        if (ch.on_remote_op) |cb| {
-                            cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                        if (ch.on_remote_op) |obs| {
+                            obs.callback(obs.ctx, conn_peer_id, plaintext);
                         }
                     }
                 }
@@ -1942,7 +2061,7 @@ pub const CollabManager = struct {
                     return;
                 }
 
-                // pv:3: encrypt the snapshot before envelope. Host's
+                // pv:4: encrypt the snapshot before envelope. Host's
                 // crypto is always initialized at startHosting (this
                 // function is only called from the host's .join handler
                 // anyway, where the host knows it has crypto). Guard
@@ -2948,7 +3067,7 @@ test "Manager.mutate pre-welcome → error.MissingWelcome" {
 
 test "Metrics: inbound_missing_welcome++ on pre-welcome op" {
     // Closes design-panel H-5 (partial — pre-welcome side). Construct a
-    // pv:3 `op` envelope (ciphertext bytes are opaque to the manager)
+    // pv:4 `op` envelope (ciphertext bytes are opaque to the manager)
     // and drive it through processMessage on a guest with crypto=null.
     // Assert metric increments and CRDT is untouched.
     const allocator = std.testing.allocator;
@@ -4196,4 +4315,183 @@ test "#145: an all-zero op peer_id falls back to the connection's" {
     try std.testing.expect(!capture.alloc_failed);
     try std.testing.expectEqual(@as(usize, 1), capture.count());
     try std.testing.expectEqualSlices(u8, &conn_peer, &capture.items.items[0].peer_id);
+}
+
+// =============================================================================
+// #387 WITNESSES — gate CRITICAL-2 and HIGH-13.
+//
+// Both findings are the same shape: a frame naming an identity, and nothing
+// checking that identity against the connection it arrived on. Both are
+// reachable by any admitted peer holding only the room key.
+// =============================================================================
+
+fn _w387HasPeer(s: *const session_mod.Session, id: [16]u8) bool {
+    for (s.peers.items) |p| {
+        if (std.mem.eql(u8, &p.id, &id)) return true;
+    }
+    return false;
+}
+
+/// Build a `sync` envelope carrying `snapshot_plaintext`, encrypted under the
+/// session's own crypto so it is indistinguishable on the wire from one the
+/// host would send. Caller owns the result.
+fn _w387SyncEnvelope(
+    allocator: std.mem.Allocator,
+    mgr: *CollabManager,
+    snapshot_plaintext: []const u8,
+) ![]const u8 {
+    const crypto = &mgr.session.crypto.?;
+    const ct = try crypto.encrypt(allocator, snapshot_plaintext, "unified-model");
+    defer allocator.free(ct);
+    return try protocol.encode(allocator, .{
+        .sync = .{ .ch = "unified-model", .snapshot = ct },
+    });
+}
+
+test "#387 C-2 WITNESS: a HOST refuses an inbound snapshot — it does not adopt peer state" {
+    // The attack: an ordinary guest — admitted, holding only the room key, no
+    // signature required because `sync` is unsigned by design — hands the host
+    // a snapshot. Before the role check the host loaded it, REPLACED its own
+    // state wholesale, and then replayed every field to its bridge attributed
+    // to itself (`null` signer = host-attributed).
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.registerDefaultChannels();
+
+    const salt = [_]u8{0xAA} ** 16;
+    const conns = try _b1TestSetupHost(&mgr, allocator, "TEST-HOSTSY", salt, 1);
+    defer _b1TestTeardownHost(&mgr, allocator, conns);
+
+    // Real host state, authored locally.
+    _ = try mgr.crdt_doc.mutate("model.kept", "\"host-truth\"");
+
+    const hostile_snapshot =
+        "{\"model.kept\":{\"v\":\"\\\"attacker-truth\\\"\",\"ts\":9999,\"p\":\"" ++ "44" ** 16 ++ "\"}}";
+    const wire = try _w387SyncEnvelope(allocator, &mgr, hostile_snapshot);
+    defer allocator.free(wire);
+
+    const dropped_before = mgr.metrics.inbound_unsigned_dropped;
+    mgr.processMessage(wire, 0);
+
+    const kept = mgr.crdt_doc.get("model.kept") orelse return error.TestExpectedFieldPresent;
+    std.debug.print(
+        \\
+        \\  #387 C-2 (host): guest sent a well-formed encrypted snapshot
+        \\    host field after   {s}   <- was "attacker-truth" before the role check
+        \\    drop metric        {d} -> {d}
+        \\
+    , .{ kept, dropped_before, mgr.metrics.inbound_unsigned_dropped });
+
+    try std.testing.expectEqualStrings("\"host-truth\"", kept);
+    try std.testing.expect(mgr.metrics.inbound_unsigned_dropped > dropped_before);
+}
+
+test "#387 C-2 WITNESS: a GUEST takes a snapshot from the host connection and no other" {
+    // The non-vacuity half, and the reason the fix is two conditions rather
+    // than one. A guest MUST still bootstrap from its host — refusing every
+    // sync would "pass" the test above while breaking the product.
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.registerDefaultChannels();
+
+    const salt = [_]u8{0xBB} ** 16;
+    _b1TestSetupGuest(&mgr, "TEST-1234", salt);
+
+    // Two connection slots. Slot 0 is the host connection by construction;
+    // slot 1 is any other peer whose frames happen to reach this manager.
+    const q0 = try SendQueue.init(allocator, 8);
+    const q1 = try SendQueue.init(allocator, 8);
+    // Teardown mirrors `_b1TestTeardownHost`: clear the connection list BEFORE
+    // `mgr.deinit` so the shutdown path never touches the `undefined` streams,
+    // then release the queues we own.
+    defer {
+        mgr.connections.clearRetainingCapacity();
+        q0.deinit();
+        q1.deinit();
+        mgr.session.state = .idle;
+    }
+    inline for ([_]*SendQueue{ q0, q1 }) |q| {
+        try mgr.connections.append(.{
+            .stream = undefined,
+            .peer_id = std.mem.zeroes([16]u8),
+            .read_thread = null,
+            .send_queue = q,
+            .write_thread = null,
+            .mask = false,
+        });
+    }
+
+    const snap =
+        "{\"model.seed\":{\"v\":\"\\\"from-host\\\"\",\"ts\":42,\"p\":\"" ++ "ab" ** 16 ++ "\"}}";
+    const wire = try _w387SyncEnvelope(allocator, &mgr, snap);
+    defer allocator.free(wire);
+
+    // From a NON-host slot: refused.
+    mgr.processMessage(wire, 1);
+    const after_bad = mgr.crdt_doc.get("model.seed");
+
+    // From the host slot: accepted.
+    mgr.processMessage(wire, 0);
+    const after_good = mgr.crdt_doc.get("model.seed");
+
+    std.debug.print(
+        \\
+        \\  #387 C-2 (guest): same snapshot, two slots
+        \\    from conn[1] (not host)  field = {s}
+        \\    from conn[0] (host)      field = {s}
+        \\
+    , .{ after_bad orelse "<absent>", after_good orelse "<absent>" });
+
+    try std.testing.expect(after_bad == null);
+    try std.testing.expectEqualStrings("\"from-host\"", after_good.?);
+}
+
+test "#387 HIGH-13 WITNESS: a peer cannot evict another by naming its id in a leave" {
+    // Eviction is not cosmetic — `peer_pubkeys` goes with the roster entry, so
+    // the victim's later signed ops fail the cross-check and are dropped. A
+    // one-frame mute of an arbitrary participant, from any admitted peer.
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+    try mgr.registerDefaultChannels();
+
+    const salt = [_]u8{0xCC} ** 16;
+    const conns = try _b1TestSetupHost(&mgr, allocator, "TEST-HOSTLV", salt, 2);
+    defer _b1TestTeardownHost(&mgr, allocator, conns);
+
+    const attacker: [16]u8 = .{0xA1} ** 16;
+    const victim_id: [16]u8 = .{0xB2} ** 16;
+
+    mgr.connections.items[0].peer_id = attacker;
+    mgr.connections.items[1].peer_id = victim_id;
+    try mgr.session.addPeer(victim_id, "Victim");
+    try mgr.session.addPeer(attacker, "Attacker");
+
+    // conn[0] (the attacker) announces the VICTIM's departure.
+    const spoof = try protocol.encode(allocator, .{ .leave = .{ .peer_id = victim_id } });
+    defer allocator.free(spoof);
+    mgr.processMessage(spoof, 0);
+
+    const victim_still_here = _w387HasPeer(&mgr.session, victim_id);
+
+    // Non-vacuity: the victim announcing its OWN departure still works, so this
+    // is not passing by ignoring every leave frame.
+    mgr.processMessage(spoof, 1);
+    const victim_left = !_w387HasPeer(&mgr.session, victim_id);
+
+    std.debug.print(
+        \\
+        \\  #387 HIGH-13: leave naming another peer's id
+        \\    spoofed from conn[0]   victim still present = {}
+        \\    honest  from conn[1]   victim departed      = {}
+        \\
+    , .{ victim_still_here, victim_left });
+
+    try std.testing.expect(victim_still_here);
+    try std.testing.expect(victim_left);
 }

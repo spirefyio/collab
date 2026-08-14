@@ -451,12 +451,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
         // any more (encryption + signed-op identity are always-on). The
         // pv field has been present since pv:2 so any well-formed v2+
         // peer always emits it.
-        const pv_val = obj.get("pv") orelse return error.UnknownProtocolVersion;
-        const pv: u32 = switch (pv_val) {
-            .integer => |i| if (i < 0) return error.InvalidField else @intCast(i),
-            else => return error.InvalidField,
-        };
-        if (pv != PROTOCOL_VERSION) return error.UnknownProtocolVersion;
+        const pv = try requireCurrentPv(obj);
 
         const room = getStr(obj, "room") orelse return error.MissingField;
         const name = getStr(obj, "name") orelse return error.MissingField;
@@ -515,12 +510,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
     }
 
     if (std.mem.eql(u8, t, "welcome")) {
-        const pv_val = obj.get("pv") orelse return error.UnknownProtocolVersion;
-        const pv: u32 = switch (pv_val) {
-            .integer => |i| if (i < 0) return error.InvalidField else @intCast(i),
-            else => return error.InvalidField,
-        };
-        if (pv != PROTOCOL_VERSION) return error.UnknownProtocolVersion;
+        const pv = try requireCurrentPv(obj);
 
         // Validate all NON-allocating fields BEFORE we allocate the salt
         // buffer. This avoids a double-free hazard where the salt has
@@ -565,7 +555,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
 
     // -------- Channel-routed messages: pv MUST be present and == 3 --------
     if (std.mem.eql(u8, t, "sync")) {
-        try requireCurrentPv(obj);
+        _ = try requireCurrentPv(obj);
         const ch = try requireChannel(obj);
         const snap_b64 = getStr(obj, "snapshot") orelse return error.MissingField;
         const snap = try decodeBase64Bounded(allocator, snap_b64, MAX_SNAPSHOT_BYTES);
@@ -580,7 +570,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
     }
 
     if (std.mem.eql(u8, t, "op")) {
-        try requireCurrentPv(obj);
+        _ = try requireCurrentPv(obj);
         const ch = try requireChannel(obj);
         const payload_b64 = getStr(obj, "payload") orelse return error.MissingField;
         // B1: sig + signer are REQUIRED on pv:4 op. Manager drops the op
@@ -615,7 +605,7 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
     }
 
     if (std.mem.eql(u8, t, "ops")) {
-        try requireCurrentPv(obj);
+        _ = try requireCurrentPv(obj);
         const ch = try requireChannel(obj);
         const batch_val = obj.get("batch") orelse return error.MissingField;
         const arr = switch (batch_val) {
@@ -686,13 +676,31 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
     return error.UnknownMessageType;
 }
 
-fn requireCurrentPv(obj: std.json.ObjectMap) !void {
+/// The ONE protocol-version check. Every routing group calls this — `join`,
+/// `welcome`, and the shared channel-frame validator.
+///
+/// #387 (gate CRITICAL-3): there used to be three byte-identical copies of the
+/// cast below, and all three were wrong the same way. `if (i < 0)` guards the
+/// negative half of the range and nothing guards the top, so `@intCast` on a
+/// value above `maxInt(u32)` is illegal behaviour: `{"t":"join","pv":4294967296}`
+/// — unauthenticated remote JSON, pre-handshake, no signature required — traps
+/// the process in any safety-enabled build instead of returning a protocol
+/// error. Three copies is also why it survived: fixing the one a reader
+/// happened to open would have left the other two live.
+///
+/// `std.math.cast` returns null on BOTH ends of the range, which is the whole
+/// point — a bound that only checks one side is not a bound.
+/// Returns the validated version so `join` can carry it in its message without
+/// re-reading (and re-casting) the field. Callers that only need the check
+/// discard the result.
+fn requireCurrentPv(obj: std.json.ObjectMap) !u32 {
     const pv_val = obj.get("pv") orelse return error.UnknownProtocolVersion;
     const pv: u32 = switch (pv_val) {
-        .integer => |i| if (i < 0) return error.InvalidField else @intCast(i),
+        .integer => |i| std.math.cast(u32, i) orelse return error.InvalidField,
         else => return error.InvalidField,
     };
     if (pv != PROTOCOL_VERSION) return error.UnknownProtocolVersion;
+    return pv;
 }
 
 /// Decode a base64 field that MUST decode to exactly `expected_len` bytes
@@ -1264,4 +1272,49 @@ test "#382 C-1: an empty peer id is refused on both arms" {
         error.InvalidPeerId,
         decode(allocator, "{\"t\":\"leave\",\"peer\":\"\"}"),
     );
+}
+
+// =============================================================================
+// #387 WITNESS — gate CRITICAL-3
+// =============================================================================
+
+test "#387 C-3 WITNESS: an out-of-u32-range pv is a protocol error, not illegal behaviour" {
+    // Unauthenticated remote JSON, pre-handshake, no signature required. Under
+    // the three copied `if (i < 0) ... else @intCast(i)` casts this reached
+    // `@intCast` with a value above `maxInt(u32)` and TRAPPED the process in
+    // any safety-enabled build. `std.math.cast` bounds both ends.
+    //
+    // Every routing group is exercised, because the defect was three copies and
+    // closing one would have looked identical from here.
+    const allocator = std.testing.allocator;
+
+    const over: i64 = @as(i64, std.math.maxInt(u32)) + 1;
+    const frames = [_][]const u8{
+        "{\"t\":\"join\",\"pv\":4294967296,\"room\":\"TEST-0001\",\"name\":\"a\",\"peer\":\"ab\"}",
+        "{\"t\":\"welcome\",\"pv\":4294967296,\"salt\":\"AAAA\",\"suite\":\"aes-gcm-v1\"}",
+        "{\"t\":\"op\",\"pv\":4294967296,\"ch\":\"unified-model\",\"payload\":\"AA\"}",
+        "{\"t\":\"ops\",\"pv\":4294967296,\"ch\":\"unified-model\",\"batch\":[]}",
+        "{\"t\":\"sync\",\"pv\":4294967296,\"ch\":\"unified-model\",\"snapshot\":\"AA\"}",
+    };
+
+    std.debug.print("\n  #387 C-3: pv={d} (maxInt(u32)+1) across {d} routing groups\n", .{ over, frames.len });
+    for (frames) |f| {
+        // The specific error is not the claim — "returns rather than traps" is.
+        // Any of these three is a correct refusal; a trap is not.
+        const r = decode(allocator, f);
+        if (r) |*m| {
+            var mm = m.*;
+            mm.deinit();
+            std.debug.print("    UNEXPECTED ACCEPT: {s}\n", .{f[0..@min(40, f.len)]});
+            return error.TestUnexpectedResult;
+        } else |err| {
+            std.debug.print("    refused with {s}\n", .{@errorName(err)});
+        }
+    }
+
+    // Non-vacuity: the SAME frames at the correct pv get past the version check
+    // (they fail later on missing/short fields, which is a different error), so
+    // this is not passing by refusing every frame that mentions `pv`.
+    const good = "{\"t\":\"join\",\"pv\":4,\"room\":\"TEST-0001\",\"name\":\"a\",\"peer\":\"ab\"}";
+    try std.testing.expectError(error.InvalidPeerId, decode(allocator, good));
 }
