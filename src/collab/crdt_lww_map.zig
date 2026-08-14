@@ -1,10 +1,19 @@
 //! LWW-Map CRDT (Last-Writer-Wins Map)
 //!
 //! Every field is tracked as a register: {value, timestamp, peer_id}.
-//! Merge rule (deterministic, commutative):
-//!   1. Higher Lamport timestamp wins
-//!   2. If timestamps equal, higher peer_id wins (lexicographic)
-//!   Result: ALL peers always converge to the SAME state.
+//! Registers at one path are ordered by the TOTAL key
+//! `(timestamp, peer_id, value_bytes)` — see `OrderingKey`, which owns the
+//! argument for why all three components are load-bearing.
+//!
+//! RETRACTION (#393), recorded here rather than only in the ticket. This header
+//! used to state a two-component rule and conclude "Result: ALL peers always
+//! converge to the SAME state." The conclusion was FALSE, and not theoretically:
+//! `(timestamp, peer_id)` is a PARTIAL order, so two ops agreeing on both but
+//! carrying different values did not replace each other and each replica kept
+//! whichever it happened to see first. Two honest replicas holding an IDENTICAL
+//! delivered set were measured diverging at cbc5e46 — the witness is
+//! `#393 PROBE D` below. Strong convergence needs same-set to imply same-state,
+//! and a merge rule that consults arrival order is not a function of the set.
 //!
 //! Uses a namespaced path system so any plugin can share state:
 //!   "model.nodes.<id>.x"                → node X position
@@ -150,6 +159,67 @@ pub const CrdtOp = struct {
     value: []const u8,
     timestamp: u64,
     peer_id: [16]u8,
+};
+
+/// The key the LWW comparison is total on, and the ONE place that order is
+/// defined. Both a stored `CrdtField` and an inbound `CrdtOp` project onto it.
+///
+/// Registers at one path are ordered by `(timestamp, peer_id, value)` in that
+/// order of significance. The third component is not decoration — it is what
+/// makes the relation an order at all. `(timestamp, peer_id)` alone is PARTIAL:
+/// it ranks two registers equal whenever both components tie, and "equal" in a
+/// merge rule means the winner is decided by whichever arrived first. Arrival
+/// order is not a function of the delivered set, so two replicas given exactly
+/// the same operations can disagree, permanently, with no anti-entropy to
+/// repair them. That is #393, and it was measured rather than argued.
+///
+/// Comparing the value BYTES closes it by exhaustion: if all three components
+/// are equal the two registers are indistinguishable, so no tie-break is owed.
+/// A digest was considered and rejected — a collision reintroduces exactly the
+/// divergence this removes, and it costs a hash per comparison that raw bytes
+/// do not.
+///
+/// The bytes compared are the DECODED value, which is what both types already
+/// hold: `std.json` unescapes before this module dupes, so a hostile peer
+/// cannot manufacture two orderings of one register by respelling the envelope
+/// (`"a"` and `"a"` arrive as the same byte). `#393 PROBE G` measures it.
+///
+/// Nothing about an attacker's freedom to choose values is a weakness here.
+/// They may pick any value they like; they cannot make two DIFFERENT values
+/// compare equal, which is the only thing that broke convergence.
+pub const OrderingKey = struct {
+    timestamp: u64,
+    peer_id: [16]u8,
+    value: []const u8,
+
+    pub fn ofField(field: CrdtField) OrderingKey {
+        return .{
+            .timestamp = field.timestamp,
+            .peer_id = field.peer_id,
+            .value = field.value,
+        };
+    }
+
+    pub fn ofOp(op: CrdtOp) OrderingKey {
+        return .{
+            .timestamp = op.timestamp,
+            .peer_id = op.peer_id,
+            .value = op.value,
+        };
+    }
+
+    /// Total order over two registers at ONE path. `.eq` means the registers
+    /// are equivalent — never "unresolved", which is the distinction the old
+    /// two-component rule silently lost.
+    pub fn order(self: OrderingKey, other: OrderingKey) std.math.Order {
+        return switch (std.math.order(self.timestamp, other.timestamp)) {
+            .eq => switch (std.mem.order(u8, &self.peer_id, &other.peer_id)) {
+                .eq => std.mem.order(u8, self.value, other.value),
+                else => |by_peer| by_peer,
+            },
+            else => |by_time| by_time,
+        };
+    }
 };
 
 /// LWW-Map CRDT document.
@@ -352,11 +422,16 @@ pub const CrdtDoc = struct {
     }
 
     /// LWW comparison: should the incoming op replace the existing field?
+    ///
+    /// Deliberately a thin call onto `OrderingKey.order` and nothing more. The
+    /// rule is stated in exactly one place so a second site cannot re-derive a
+    /// subtly different — or, as in #393, a merely PARTIAL — version of it.
+    ///
+    /// Strictly `.gt`, which is also what keeps `applyRemote` idempotent as the
+    /// `CrdtInterface` contract requires: an op already merged compares `.eq`
+    /// against itself and reports no change.
     fn shouldReplace(existing: CrdtField, incoming: CrdtOp) bool {
-        if (incoming.timestamp > existing.timestamp) return true;
-        if (incoming.timestamp < existing.timestamp) return false;
-        // Tie-break: higher peer_id wins (lexicographic)
-        return std.mem.order(u8, &incoming.peer_id, &existing.peer_id) == .gt;
+        return OrderingKey.ofOp(incoming).order(OrderingKey.ofField(existing)) == .gt;
     }
 
     /// Serialize the full CRDT state for syncing a new peer.
@@ -1381,4 +1456,193 @@ test "#382 C-1 WITNESS: an op carrying a SHORT peer id is refused by the decoder
     defer allocator.free(op.path);
     defer allocator.free(op.value);
     try std.testing.expectEqualSlices(u8, &([_]u8{0xAB} ** 16), &op.peer_id);
+}
+
+// =============================================================================
+// #393 WITNESSES — the LWW order is TOTAL
+//
+// Found by the Codex SOL MAX design consultation on #392, and measured before
+// it was believed. Neither I nor either of the two prior adversarial gates had
+// found it; it was live in shipped code and independent of the timestamp
+// question entirely.
+//
+// The arms that exercise convergence drive the REAL wire codec through the
+// `CrdtInterface` vtable rather than hand-built structs, because an order that
+// is total in memory but not after a round-trip is not total at the only place
+// replicas actually meet.
+// =============================================================================
+
+test "#393 PROBE D: ops equal in ts AND peer converge regardless of arrival order" {
+    // The equivocation witness, and the permanent regression test for the
+    // defect itself.
+    //
+    // Both ops are individually well-formed and clear every existing guard.
+    // They agree on timestamp and on peer_id — and `p` is attacker-chosen
+    // (#383), so signing both members of the pair needs no privileged position
+    // — differing only in VALUE. Under the old two-component rule neither
+    // replaced the other, so each replica kept whichever it happened to see
+    // first and no anti-entropy exists to repair the split.
+    const allocator = std.testing.allocator;
+
+    const equivocating_peer: [16]u8 = .{0x7F} ** 16;
+    const p = CrdtOp{ .path = "k", .value = "\"A\"", .timestamp = 9, .peer_id = equivocating_peer };
+    const q = CrdtOp{ .path = "k", .value = "\"B\"", .timestamp = 9, .peer_id = equivocating_peer };
+
+    const p_bytes = try encodeOpBytes(allocator, p);
+    defer allocator.free(p_bytes);
+    const q_bytes = try encodeOpBytes(allocator, q);
+    defer allocator.free(q_bytes);
+
+    // Two honest replicas. Identical delivered SET, opposite delivered ORDER.
+    var doc_pq = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc_pq.deinit();
+    var doc_qp = CrdtDoc.initWithPeerId(allocator, .{0x02} ** 16);
+    defer doc_qp.deinit();
+
+    _ = try doc_pq.interface().applyRemote(p_bytes);
+    _ = try doc_pq.interface().applyRemote(q_bytes);
+    _ = try doc_qp.interface().applyRemote(q_bytes);
+    _ = try doc_qp.interface().applyRemote(p_bytes);
+
+    const saw_pq = doc_pq.get("k").?;
+    const saw_qp = doc_qp.get("k").?;
+
+    std.debug.print(
+        \\
+        \\  #393 PROBE D: identical delivered set, opposite arrival order
+        \\    peer A saw P then Q -> {s}
+        \\    peer B saw Q then P -> {s}
+        \\    DIVERGED: {}
+        \\
+    , .{ saw_pq, saw_qp, !std.mem.eql(u8, saw_pq, saw_qp) });
+
+    try std.testing.expectEqualStrings(saw_pq, saw_qp);
+    // Non-vacuity: they agree on the value the ORDER names, rather than by both
+    // dropping the field or both keeping whatever came first.
+    try std.testing.expectEqualStrings("\"B\"", saw_pq);
+}
+
+test "#393 PROBE G: two wire spellings of one register produce the SAME ordering key" {
+    // Canonicality. The tie-break compares DECODED value bytes, so a hostile
+    // peer cannot mint a second, differently-ordered copy of one register by
+    // respelling its JSON envelope. Were this to fail, PROBE D would reopen
+    // through the encoder rather than through the comparator.
+    const allocator = std.testing.allocator;
+
+    const hex = "7f" ** 16;
+    const plain = "{\"path\":\"k\",\"v\":\"\\\"a\\\"\",\"ts\":9,\"p\":\"" ++ hex ++ "\"}";
+    const respelled = "{\"path\":\"k\",\"v\":\"\\u0022\\u0061\\u0022\",\"ts\":9,\"p\":\"" ++ hex ++ "\"}";
+
+    const a = try decodeOpBytes(allocator, plain);
+    defer allocator.free(a.path);
+    defer allocator.free(a.value);
+    const b = try decodeOpBytes(allocator, respelled);
+    defer allocator.free(b.path);
+    defer allocator.free(b.value);
+
+    const ord = OrderingKey.ofOp(a).order(OrderingKey.ofOp(b));
+    std.debug.print(
+        \\
+        \\  #393 PROBE G: canonicality of the ordering key
+        \\    plain envelope     -> {d} decoded bytes {any}
+        \\    \u-escaped envelope -> {d} decoded bytes {any}
+        \\    ordering key compares: {s}
+        \\
+    , .{ a.value.len, a.value, b.value.len, b.value, @tagName(ord) });
+
+    try std.testing.expectEqualSlices(u8, a.value, b.value);
+    try std.testing.expectEqual(std.math.Order.eq, ord);
+}
+
+test "#393: the ordering key survives the wire — encode then decode preserves it" {
+    // The round-trip invariant: ordering_key(reg) == ordering_key(decode(encode(reg))).
+    // Distinct from PROBE G, which fixes the ENVELOPE and varies its spelling;
+    // this fixes the register and varies nothing, guarding against codec drift
+    // that would silently reorder registers a replica already holds.
+    const allocator = std.testing.allocator;
+
+    const cases = [_]CrdtOp{
+        .{ .path = "k", .value = "\"plain\"", .timestamp = 1, .peer_id = .{0x00} ** 16 },
+        .{ .path = "k", .value = "\"quote\\\"inside\"", .timestamp = 2, .peer_id = .{0xFF} ** 16 },
+        .{ .path = "k", .value = "", .timestamp = 3, .peer_id = .{0xAB} ** 16 }, // tombstone
+        .{ .path = "k", .value = "{\"nested\":[1,2,3]}", .timestamp = MAX_TIMESTAMP, .peer_id = .{0x7F} ** 16 },
+    };
+
+    for (cases, 1..) |op, row| {
+        const bytes = try encodeOpBytes(allocator, op);
+        defer allocator.free(bytes);
+        const back = try decodeOpBytes(allocator, bytes);
+        defer allocator.free(back.path);
+        defer allocator.free(back.value);
+
+        const ord = OrderingKey.ofOp(op).order(OrderingKey.ofOp(back));
+        std.debug.print(
+            "  #393 round-trip row {d}: ts {d}, {d} value bytes -> ordering key compares {s}\n",
+            .{ row, op.timestamp, op.value.len, @tagName(ord) },
+        );
+        try std.testing.expectEqual(std.math.Order.eq, ord);
+    }
+}
+
+test "#393: value is the LAST discriminator, not a shortcut past ts or peer" {
+    // Non-vacuity for the fix itself. A suite that only proved "equal ts and
+    // equal peer converge" would also pass if the comparator had been replaced
+    // by a bare value comparison — a different, and wrong, CRDT. Each row plants
+    // a value that would LOSE on bytes alone and must still win on the more
+    // significant component, so a regression names WHICH component broke.
+    const zero: [16]u8 = .{0x00} ** 16;
+    const high: [16]u8 = .{0xFF} ** 16;
+
+    // Higher ts wins even though its value sorts lower.
+    const newer = OrderingKey{ .timestamp = 2, .peer_id = zero, .value = "\"a\"" };
+    const older = OrderingKey{ .timestamp = 1, .peer_id = high, .value = "\"z\"" };
+    try std.testing.expectEqual(std.math.Order.gt, newer.order(older));
+
+    // Same ts: higher peer wins even though its value sorts lower.
+    const loud = OrderingKey{ .timestamp = 5, .peer_id = high, .value = "\"a\"" };
+    const quiet = OrderingKey{ .timestamp = 5, .peer_id = zero, .value = "\"z\"" };
+    try std.testing.expectEqual(std.math.Order.gt, loud.order(quiet));
+
+    // Only once ts AND peer tie does the value decide.
+    const val_b = OrderingKey{ .timestamp = 5, .peer_id = high, .value = "\"b\"" };
+    const val_a = OrderingKey{ .timestamp = 5, .peer_id = high, .value = "\"a\"" };
+    try std.testing.expectEqual(std.math.Order.gt, val_b.order(val_a));
+
+    // Total: identical registers compare EQUAL. That is the property the old
+    // rule lost, and the one idempotency below rests on.
+    try std.testing.expectEqual(std.math.Order.eq, val_b.order(val_b));
+
+    std.debug.print(
+        "\n  #393 significance: ts outranks value, peer outranks value, value settles only the last tie\n",
+        .{},
+    );
+}
+
+test "#393: replaying an already-merged op reports no change (CrdtInterface contract)" {
+    // `crdt_interface.zig` states idempotency as a contract every CRDT must
+    // meet. It survives the third component precisely because equal registers
+    // now compare `.eq` rather than being ranked by arrival, so this is a
+    // witness for the contract and not merely for the comparator.
+    const allocator = std.testing.allocator;
+
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc.deinit();
+
+    const op = CrdtOp{ .path = "k", .value = "\"v\"", .timestamp = 4, .peer_id = .{0x7F} ** 16 };
+    const bytes = try encodeOpBytes(allocator, op);
+    defer allocator.free(bytes);
+
+    const first = try doc.interface().applyRemote(bytes);
+    const second = try doc.interface().applyRemote(bytes);
+    const third = try doc.interface().applyRemote(bytes);
+
+    std.debug.print(
+        "\n  #393 idempotency: applyRemote x3 -> changed={} {} {}; value still {s}\n",
+        .{ first, second, third, doc.get("k").? },
+    );
+
+    try std.testing.expect(first);
+    try std.testing.expect(!second);
+    try std.testing.expect(!third);
+    try std.testing.expectEqualStrings("\"v\"", doc.get("k").?);
 }
