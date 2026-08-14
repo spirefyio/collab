@@ -53,105 +53,65 @@ pub const Mutation = struct {
 };
 
 // =============================================================================
-// TIMESTAMP POLICY (#386, superseding #382 C-3)
+// VERSION POLICY (#392, superseding #386, which superseded #382 C-3)
 //
-// #382 C-3 collapsed three different jobs into one number and got all three
-// wrong. RETRACTION, recorded here rather than only in the ticket: the previous
-// comment on this constant claimed `1 << 62` "keeps the wire format closed
-// under its own arithmetic". It does not, and the claim was refuted by
-// measurement, not argument — an op admitted at exactly `1 << 62` left the
-// clock at `1 << 62 + 1`, which the emit-side guard then refused forever. `>=`
-// would only have moved the cliff one value down. The mistake was structural:
+// #382 C-3 collapsed three jobs into one number. #386 split it into three
+// constants and preserved the underlying mistake, which this change removes: a
+// bounded DOCUMENT-WIDE scalar was serving as both the admission policy for
+// remote ops and the per-field register version. Those two jobs have opposite
+// requirements, and every defect in this area descends from the conflation.
 //
-//   an ABSOLUTE acceptance ceiling is never closed under Lamport's `+1`,
-//   because the value it admits is the value the clock must then exceed.
+//   ADMISSION decides which ops enter the applied set. It must be
+//   REPLICA-INDEPENDENT, because convergence IS the statement that the same
+//   delivered set yields the same state. A bound computed from the receiver's
+//   own history is not a property of the op, so two honest peers with different
+//   histories admit different subsets and diverge. (#392 PROBE A.)
 //
-// The three jobs, now three constants:
+//   GENERATION decides the version a replica stamps on values it ORIGINATES.
+//   It is purely local and may consult anything local it likes, because it can
+//   only affect ops this peer authors.
 //
-//   MAX_TIMESTAMP            what the WIRE can carry. Hard, external, not a
-//                            policy — `maxInt(i64)`, because that is where a
-//                            JSON integer stops.
-//   MAX_FORWARD_JUMP         the acceptance policy for LIVE ops. RELATIVE to
-//                            the local clock, which is the whole point: a
-//                            relative bound rises with the clock instead of
-//                            standing in front of it, so the admitted set is
-//                            closed under `+1` by construction.
-//   MAX_SNAPSHOT_TIMESTAMP   the acceptance bound for SNAPSHOT fields, where
-//                            no relative bound is meaningful (a joining peer
-//                            has no causal frame yet). Absolute, and set to
-//                            leave `SNAPSHOT_WRITE_HEADROOM` writes available.
+// So admission now accepts the codec's entire range and nothing narrower, and
+// generation is `field_floor + 1` — per-field, with no global input at all.
 //
-// The live path and the snapshot path answer different questions, which is why
-// they get different bounds rather than one shared constant — sharing one was
-// #382's original error and the first draft of #386 reproduced it. Each
-// constant's own doc carries the argument for its value.
+// What that deletes, and why each had to go:
+//
+//   MAX_FORWARD_JUMP         a RECEIVER-RELATIVE admission bound. Replica-
+//                            dependent by construction, so it broke the very
+//                            property it was written to defend. (PROBE A.)
+//   the document-wide clock  one hostile op dragged the shared counter toward
+//                            the ceiling and bricked writes on every UNRELATED
+//                            path. Exhaustion is now per-field: poisoning `x`
+//                            costs you `x` and nothing else. (PROBE B.)
+//   MAX_SNAPSHOT_TIMESTAMP   an absolute snapshot bound BELOW the wire ceiling,
+//                            which made the decoder refuse timestamps its own
+//                            encoder emits. The snapshot now round-trips its
+//                            own output. (PROBE C.)
+//
+// SEQUENCING, recorded because getting it wrong is worse than not starting:
+// "accept every remote timestamp" must NOT land while a document-wide clock is
+// still advancing. That combination exposes PROBE B immediately — one op at the
+// wire ceiling would brick the document outright. Admission, generation and the
+// snapshot bound are one atomic change for that reason.
+//
+// The staircase, recorded so no future session re-proposes the clamp I did:
+// bounding how far the clock may ADVANCE does not work either. At
+// `clock = M - A`, one op at `M` gives `min(M, (M-A)+A) + 1 = M + 1`. The clamp
+// only chooses how many steps the walk takes; it never establishes closure. No
+// value of `A` works, and the same arithmetic kills any ABSOLUTE acceptance
+// ceiling `A` below the wire ceiling: admitting `A` leaves the version at
+// `A + 1`, so the next write needs `A + 2 <= A`.
 // =============================================================================
 
-/// The wire's hard ceiling. `ts` is written as a bare JSON number and every
-/// decoder accepts only `std.json.Value.integer`, which tops out at
-/// `maxInt(i64)`; a larger number parses as `.number_string` and is refused.
-/// This is a property of the encoding, not a policy choice, so it is not
-/// negotiable and not tunable.
+/// The wire's hard ceiling, and now the ONLY bound on admission.
+///
+/// `ts` is written as a bare JSON number and every decoder accepts only
+/// `std.json.Value.integer`, which tops out at `maxInt(i64)`; a larger number
+/// parses as `.number_string` and is refused. This is a property of the
+/// encoding rather than a policy choice, which is exactly what makes it safe to
+/// admit against: it is identical on every replica, so it cannot make two peers
+/// disagree about which ops were delivered.
 pub const MAX_TIMESTAMP: u64 = std.math.maxInt(i64);
-
-/// How far ahead of the LOCAL clock a single live remote op may jump. This is
-/// the ONLY acceptance policy for live ops, and it is deliberately relative.
-///
-/// SECOND RETRACTION, and it belongs here because the first draft of this very
-/// fix repeated the mistake it was written to close. That draft added an
-/// absolute `MAX_ADMISSIBLE_TIMESTAMP` below the wire ceiling and refused ops
-/// above it. The witness in this file caught it within one build: a peer whose
-/// clock legitimately reached that ceiling emitted ops its OWN decoder then
-/// rejected — the identical failure #382 had, relocated to a nicer constant.
-///
-/// The reason is arithmetic and admits no clever choice of value. If decoders
-/// accept up to `A`, then `applyRemoteOp` can leave the clock at `A + 1`, and
-/// the next local write emits `A + 2`, which needs `A + 2 <= A`. No absolute
-/// `A` below the wire ceiling can be closed under Lamport's `+1`.
-///
-/// A RELATIVE bound has no such fixed point: the admitted ceiling always sits
-/// `MAX_FORWARD_JUMP` above wherever the clock currently is, so it rises with
-/// the clock instead of standing in front of it. That is what makes the
-/// admitted set closed under `+1` by construction rather than by argument.
-///
-/// What it costs an attacker: dragging a peer to the wire ceiling now takes
-/// ~2^31 successive admitted ops instead of one message, each individually
-/// signed, decrypted, and under the frame cap. A silent one-shot brick becomes
-/// a sustained flood that the fairness quota and the metrics can both see.
-///
-/// 2^32 (~4.29e9) sits far above any legitimate divergence: peers bootstrap
-/// from a `sync` snapshot before live ops arrive (the `.sync` arm's
-/// `setConnected` invariant), so the honest forward jump is the op count
-/// accumulated during one disconnect, not the session's whole history.
-pub const MAX_FORWARD_JUMP: u64 = 1 << 32;
-
-/// Local writes a loaded snapshot must leave available.
-///
-/// The snapshot side is the one place the relative bound cannot apply: a
-/// joining peer has no causal frame of its own yet — adopting the host's frame
-/// wholesale is the entire point of a snapshot — so "how far ahead is this?"
-/// has no meaningful answer. An absolute reserve is the honest substitute, and
-/// it is safe here precisely because a snapshot is adopted rather than chained:
-/// nothing downstream has to exceed the value we accepted except this peer's
-/// own writes, and this reserve is what guarantees it has some.
-///
-/// 2^40 is ~1.1e12 writes; at a sustained 1,000 writes/second, ~34,000 years.
-pub const SNAPSHOT_WRITE_HEADROOM: u64 = 1 << 40;
-
-/// The largest timestamp `loadSnapshot` will adopt for a field. A field above
-/// this is DROPPED — not clamped, and not cause to refuse the whole snapshot.
-///
-/// Dropping is what keeps this convergent: the bound is a compile-time
-/// constant, so every peer drops exactly the same field and they still agree.
-/// Clamping would have each peer invent a different replacement timestamp from
-/// its own clock, which is precisely how a CRDT stops being one.
-///
-/// Note what this does for state that is ALREADY poisoned: a `.spf` written by
-/// the `1 << 62` build carries fields at ~4.61e18, far below this bound, so
-/// those fields load normally and leave ~4.61e18 writes of room. The
-/// already-poisoned case needs neither clamp nor quarantine — it was never the
-/// data that was wrong, it was the ceiling standing in front of it.
-pub const MAX_SNAPSHOT_TIMESTAMP: u64 = MAX_TIMESTAMP - SNAPSHOT_WRITE_HEADROOM;
 
 /// A CRDT operation — the unit of replication sent over the wire.
 pub const CrdtOp = struct {
@@ -227,8 +187,13 @@ pub const OrderingKey = struct {
 pub const CrdtDoc = struct {
     allocator: std.mem.Allocator,
     fields: std.StringHashMap(CrdtField),
-    clock: u64,
     peer_id: [16]u8,
+
+    // #392 DELETED the `clock: u64` field that used to sit here. It was the
+    // document-wide scalar this module was built around, and removing it is the
+    // substance of the fix rather than a tidy-up: while it existed, any remote
+    // op could move the version floor of every field in the document at once.
+    // Versions are now read from and written to the field they belong to.
 
     pub fn init(allocator: std.mem.Allocator) CrdtDoc {
         var peer_id: [16]u8 = undefined;
@@ -236,7 +201,6 @@ pub const CrdtDoc = struct {
         return .{
             .allocator = allocator,
             .fields = std.StringHashMap(CrdtField).init(allocator),
-            .clock = 0,
             .peer_id = peer_id,
         };
     }
@@ -245,9 +209,20 @@ pub const CrdtDoc = struct {
         return .{
             .allocator = allocator,
             .fields = std.StringHashMap(CrdtField).init(allocator),
-            .clock = 0,
             .peer_id = peer_id,
         };
+    }
+
+    /// The version floor at `path`: what this replica currently holds there, or
+    /// 0 if it holds nothing. The sole input to local version generation.
+    ///
+    /// A tombstone still has a floor. Deleting is `mutate(path, "")` — an empty
+    /// VALUE, not a map removal — so the register and its version survive and
+    /// `floor + 1` stays monotonic across a delete/recreate cycle. Measured
+    /// (#392 PROBE E), and it is why no separate tombstone machinery is owed.
+    fn versionFloor(self: *const CrdtDoc, path: []const u8) u64 {
+        const field = self.fields.get(path) orelse return 0;
+        return field.timestamp;
     }
 
     pub fn deinit(self: *CrdtDoc) void {
@@ -260,37 +235,33 @@ pub const CrdtDoc = struct {
     }
 
     /// Apply a local mutation. Returns the CrdtOp to broadcast to peers.
+    ///
+    /// The version is `versionFloor(path) + 1` — one past whatever this replica
+    /// holds at that path, and nothing else.
+    ///
+    /// #392 RETRACTS the previous `max(document_clock, ...) + 1`. A shared
+    /// counter let any peer's edit volume inflate the version of every field,
+    /// and let ONE hostile op exhaust paths it had never touched (PROBE B).
+    /// Pure per-field generation also removes the noisy-peer bias a hybrid
+    /// would have kept: a chatty peer no longer wins conflicts on quiet fields
+    /// merely by having written a lot elsewhere.
+    ///
+    /// Exhaustion is per-field for the same reason. A field pinned at the wire
+    /// ceiling refuses further LOCAL writes to THAT path and leaves every other
+    /// path fully writable. Refusing is still better than the alternative at
+    /// the true ceiling, which is emitting a version no peer — including a
+    /// future self reading its own snapshot — can decode.
     pub fn mutate(self: *CrdtDoc, path: []const u8, value: []const u8) !CrdtOp {
-        // #386 emit side, and #392 RETRACTS what this comment used to claim.
-        //
-        // It said this guard was "unreachable by construction" and justified
-        // that with two constants — `MAX_ADMISSIBLE_TIMESTAMP` and
-        // `WRITE_HEADROOM` — that DO NOT EXIST in this file. They were the
-        // first draft's names, deleted when the policy became relative, and the
-        // comment was never updated. So the change that retracted three false
-        // doc claims shipped a fourth. Found by the gate on bf4eaff.
-        //
-        // WHAT IS ACTUALLY TRUE, measured (#392 PROBE B): exhaustion is
-        // reachable. From a snapshot at `MAX_SNAPSHOT_TIMESTAMP`, 255 admitted
-        // forward jumps plus one op at the wire ceiling put the clock at
-        // 9223372036854775808 — one PAST `MAX_TIMESTAMP` — and every later
-        // local write returns `ClockExhausted`. The relative bound made the
-        // brick cost 256 signed ops instead of one message; it did not make it
-        // impossible, and this comment should never have said otherwise.
-        //
-        // Kept as a guard rather than an assert because the alternative at the
-        // true wire ceiling is emitting bytes no peer — including a future self
-        // reading its own snapshot — can decode. Refusing the write and saying
-        // so is strictly better than silently splitting the room.
-        if (self.clock >= MAX_TIMESTAMP) return error.ClockExhausted;
-        self.clock += 1;
+        const floor = self.versionFloor(path);
+        if (floor >= MAX_TIMESTAMP) return error.FieldVersionExhausted;
+        const version = floor + 1;
 
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
 
         const field = CrdtField{
             .value = owned_value,
-            .timestamp = self.clock,
+            .timestamp = version,
             .peer_id = self.peer_id,
         };
 
@@ -308,7 +279,7 @@ pub const CrdtDoc = struct {
         return CrdtOp{
             .path = path,
             .value = value,
-            .timestamp = self.clock,
+            .timestamp = version,
             .peer_id = self.peer_id,
         };
     }
@@ -332,18 +303,24 @@ pub const CrdtDoc = struct {
     /// Tracked as its own ticket; do not read the absence of "atomically" here
     /// as the absence of a known defect.
     pub fn mutateBatch(self: *CrdtDoc, mutations: []const Mutation) ![]CrdtOp {
-        // Preflight the clock for the whole batch, so `ClockExhausted` is an
-        // all-or-nothing answer rather than a committed prefix.
+        // Preflight every field the batch touches, so `FieldVersionExhausted`
+        // stays an all-or-nothing answer rather than a committed prefix.
         //
-        // #392 (gate HIGH): the ceiling check below is NOT redundant, and the
-        // comment that used to sit here — claiming the subtraction "keeps it in
-        // range for any clock value" — was false. `applyRemoteOp` can leave the
-        // clock at `MAX_TIMESTAMP + 1` (measured, PROBE B), and once it does,
-        // `MAX_TIMESTAMP - self.clock` UNDERFLOWS. In a safe build that is a
-        // panic inside a peer's message loop, reached even by an empty batch.
-        // Check the ceiling first; only then is the subtraction defined.
-        if (self.clock >= MAX_TIMESTAMP) return error.ClockExhausted;
-        if (mutations.len > MAX_TIMESTAMP - self.clock) return error.ClockExhausted;
+        // Deliberately CONSERVATIVE: each path is checked as though the entire
+        // batch targeted it. Exact per-path counts would need a map allocation
+        // in order to admit a batch that cannot occur in practice — a field
+        // only reaches the wire ceiling by adopting a hostile remote op, since
+        // local writes advance it one at a time.
+        //
+        // The ceiling check is FIRST and is not redundant: without it the
+        // subtraction underflows for a field already at or past the ceiling,
+        // which in a safe build is a panic inside a peer's message loop. That
+        // was a real #392 finding against the previous document-wide form.
+        for (mutations) |m| {
+            const floor = self.versionFloor(m.path);
+            if (floor >= MAX_TIMESTAMP) return error.FieldVersionExhausted;
+            if (MAX_TIMESTAMP - floor < mutations.len) return error.FieldVersionExhausted;
+        }
 
         const ops = try self.allocator.alloc(CrdtOp, mutations.len);
         errdefer self.allocator.free(ops);
@@ -357,34 +334,25 @@ pub const CrdtDoc = struct {
     /// Merge a remote operation. Returns true if local state changed.
     /// Implements LWW: higher timestamp wins; tie-break by peer_id (lexicographic).
     pub fn applyRemoteOp(self: *CrdtDoc, op: CrdtOp) !bool {
-        // #386: refuse before touching the clock. Both guards run here and not
-        // only at the wire boundary, because this is the invariant that keeps
-        // the emit side live, and the direct-call path (tests, and any future
-        // in-process caller) must not be able to bypass it.
-
-        // The wire ceiling. An invariant check, not a policy: `std.json`
-        // decodes `.integer` as i64, so a decoded op cannot exceed this — but
-        // a direct in-process caller can, and the clock arithmetic below is
-        // only safe because nothing above this gets past here.
+        // The ONLY admission check, and it is an invariant rather than a
+        // policy. `std.json` decodes `.integer` as i64, so a decoded op cannot
+        // exceed this; a direct in-process caller can, and a version above the
+        // wire ceiling is one this peer could never re-encode. It runs here and
+        // not only at the wire boundary so the direct-call path — tests, and
+        // any future in-process caller — cannot bypass it.
+        //
+        // #392 DELETED the receiver-relative forward-jump bound that used to
+        // stand below this line. It was computed from THIS peer's clock, so
+        // whether an op was admitted depended on what the receiver happened to
+        // have seen already. Two honest peers with different histories admitted
+        // different subsets of one delivered set and diverged (PROBE A).
+        // Admission has to be a property of the OP, identical on every replica.
+        //
+        // #392 also DELETED the `clock = max(clock, op.timestamp) + 1` advance.
+        // A remote op now touches exactly the one field it names; it cannot
+        // move the version floor of any other path, which is what let a single
+        // hostile op brick an entire document (PROBE B).
         if (op.timestamp > MAX_TIMESTAMP) return error.TimestampOutOfRange;
-
-        // The acceptance policy. Written as a subtraction on the OP's side so
-        // it cannot overflow for any `op.timestamp`, rather than as
-        // `self.clock + MAX_FORWARD_JUMP` which would have to reason about the
-        // clock's own range to be safe.
-        if (op.timestamp > MAX_FORWARD_JUMP and
-            op.timestamp - MAX_FORWARD_JUMP > self.clock)
-        {
-            return error.TimestampTooFarAhead;
-        }
-
-        // Advance Lamport clock: max(local, remote) + 1. CHECKED addition, not
-        // `+|`. Saturation was #382's habit of hiding a broken invariant behind
-        // a plausible-looking value; here the guard above proves `@max` is at
-        // most `MAX_TIMESTAMP` (~9.22e18), which is less than half the u64
-        // range, so an overflow would be a real bug and should trap rather than
-        // silently pin the clock at a value nothing can exceed.
-        self.clock = @max(self.clock, op.timestamp) + 1;
 
         if (self.fields.getPtr(op.path)) |existing| {
             if (!shouldReplace(existing.*, op)) {
@@ -500,8 +468,6 @@ pub const CrdtDoc = struct {
             }
             staged.deinit();
         }
-        var staged_clock: u64 = self.clock;
-
         var it = obj.iterator();
         while (it.next()) |entry| {
             const path = entry.key_ptr.*;
@@ -527,10 +493,12 @@ pub const CrdtDoc = struct {
                 .integer => |i| if (i < 0) continue else @intCast(i),
                 else => continue,
             };
-            // #386, snapshot side — see `MAX_SNAPSHOT_TIMESTAMP` for why this
-            // is an absolute bound here and a relative one for live ops, and
-            // why the field is dropped rather than clamped.
-            if (ts > MAX_SNAPSHOT_TIMESTAMP) continue;
+            // #392 DELETED the `ts > MAX_SNAPSHOT_TIMESTAMP` drop that used to
+            // sit here. That bound was BELOW the wire ceiling, so this decoder
+            // refused timestamps its own encoder emits and a snapshot could
+            // fail to round-trip its own output (PROBE C). The wire ceiling is
+            // enforced by `ts_val` being `.integer` — an i64 — so every value
+            // that parses at all is one this peer can re-encode.
             const peer_hex = switch (p_val) {
                 .string => |s| s,
                 else => continue,
@@ -548,9 +516,6 @@ pub const CrdtDoc = struct {
                 .timestamp = ts,
                 .peer_id = peer_id,
             });
-
-            // Advance clock past any timestamp in the snapshot
-            staged_clock = @max(staged_clock, ts);
         }
 
         // Commit. Every fallible step is above this line; nothing below can
@@ -566,7 +531,6 @@ pub const CrdtDoc = struct {
         }
         self.fields.deinit();
         self.fields = staged;
-        self.clock = staged_clock;
     }
 
     /// Export the merged CRDT state as a flat JSON object: {"path": "value", ...}
@@ -794,15 +758,15 @@ pub fn decodeOpBytes(allocator: std.mem.Allocator, bytes: []const u8) !CrdtOp {
         .integer => |i| if (i < 0) return error.InvalidOpBytes else @intCast(i),
         else => return error.InvalidOpBytes,
     };
-    // #386: the wire ceiling, checked here so the invariant is stated at the
-    // boundary that owns it. Structurally unreachable — `std.json` yields
-    // `.integer` as i64 and the negative case returned above — which is the
-    // point: if it ever fires, the decoder's own assumptions have changed.
+    // The wire ceiling, checked here so the invariant is stated at the boundary
+    // that owns it. Structurally unreachable — `std.json` yields `.integer` as
+    // i64 and the negative case returned above — which is the point: if it ever
+    // fires, the decoder's own assumptions have changed.
     //
-    // Deliberately NOT the acceptance policy. Admission is `applyRemoteOp`'s
-    // job because it is relative to a clock this function cannot see; putting
-    // an absolute acceptance bound here is exactly the mistake #382 made and
-    // the first draft of #386 repeated.
+    // Since #392 this is the SAME bound `applyRemoteOp` applies, not a weaker
+    // one, because admission is no longer relative to anything. Both sites keep
+    // their own check: this one states what the codec can carry, and that one
+    // guards the direct in-process path a decoder never sees.
     if (ts > MAX_TIMESTAMP) return error.InvalidOpBytes;
     const p_hex = switch (p_val) {
         .string => |s| s,
@@ -862,7 +826,11 @@ test "CrdtDoc: mutate overwrites previous value" {
     _ = try doc.mutate("x", "1");
     _ = try doc.mutate("x", "2");
     try std.testing.expectEqualStrings("2", doc.get("x").?);
-    try std.testing.expectEqual(@as(u64, 2), doc.clock);
+    // #392: the version is the FIELD's, not a document-wide clock's. Two writes
+    // to one path leave that path at 2 — and, unlike the old shared counter,
+    // leave every other path still at 0.
+    try std.testing.expectEqual(@as(u64, 2), doc.versionFloor("x"));
+    try std.testing.expectEqual(@as(u64, 0), doc.versionFloor("untouched"));
 }
 
 test "CrdtDoc: applyRemoteOp merges correctly" {
@@ -988,7 +956,16 @@ test "CrdtDoc: toModelJson excludes tombstones" {
     try std.testing.expect(std.mem.indexOf(u8, json, "dead") == null);
 }
 
-test "CrdtDoc: Lamport clock advances on remote ops" {
+test "#392 PROBE B: a remote op raises ONLY the field it names" {
+    // RETRACTION AND REPLACEMENT. This slot held "CrdtDoc: Lamport clock
+    // advances on remote ops", which asserted `clock == 51` after one remote op
+    // at ts=50 and then a local write at 52 on an UNRELATED path. That test was
+    // green, correct about the code, and locking in the defect: it certified
+    // that one peer's op moved the version of every path in the document, which
+    // is exactly how a single hostile op at the wire ceiling bricked writes
+    // everywhere (PROBE B).
+    //
+    // The property now asserted is the opposite and strictly stronger.
     const allocator = std.testing.allocator;
     var doc = CrdtDoc.init(allocator);
     defer doc.deinit();
@@ -1000,12 +977,63 @@ test "CrdtDoc: Lamport clock advances on remote ops" {
         .peer_id = [_]u8{0xAA} ** 16,
     });
 
-    // Clock should be max(0, 50) + 1 = 51
-    try std.testing.expectEqual(@as(u64, 51), doc.clock);
+    // The named field adopts the remote version. Nothing else moves. Both
+    // floors are SAMPLED here, before any local write disturbs them, so the
+    // printed numbers are the ones the assertions actually checked.
+    const named_floor = doc.versionFloor("x");
+    const untouched_floor = doc.versionFloor("y");
+    try std.testing.expectEqual(@as(u64, 50), named_floor);
+    try std.testing.expectEqual(@as(u64, 0), untouched_floor);
 
-    // Next local mutation should use clock=52
+    // A local write on the untouched path starts from ITS floor, not the
+    // remote peer's number. Under the old shared clock this was 52.
     const op = try doc.mutate("y", "2");
-    try std.testing.expectEqual(@as(u64, 52), op.timestamp);
+    try std.testing.expectEqual(@as(u64, 1), op.timestamp);
+
+    // And a local write on the touched path correctly follows the remote one.
+    const follow = try doc.mutate("x", "3");
+    try std.testing.expectEqual(@as(u64, 51), follow.timestamp);
+
+    std.debug.print(
+        "\n  #392 PROBE B: remote ts=50 on 'x' -> floor(x)={d} floor(y)={d}; then local y={d} (was 52 under the shared clock), local x={d}\n",
+        .{ named_floor, untouched_floor, op.timestamp, follow.timestamp },
+    );
+}
+
+test "#392 PROBE B: ONE op at the wire ceiling cannot brick an unrelated path" {
+    // The exhaustion half, measured as the quantity it actually is. Under the
+    // document-wide clock this op left the counter at `MAX_TIMESTAMP + 1` and
+    // every later write ANYWHERE returned `ClockExhausted` — a one-message
+    // permanent brick of the whole document. Exhaustion is now per-field.
+    const allocator = std.testing.allocator;
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
+    defer doc.deinit();
+
+    _ = try doc.applyRemoteOp(.{
+        .path = "poisoned",
+        .value = "\"pin\"",
+        .timestamp = MAX_TIMESTAMP,
+        .peer_id = .{0x44} ** 16,
+    });
+
+    // The poisoned path is spent — refused, not silently emitting a version no
+    // decoder could read back.
+    try std.testing.expectError(
+        error.FieldVersionExhausted,
+        doc.mutate("poisoned", "\"mine\""),
+    );
+
+    // Every other path is untouched and fully writable.
+    const elsewhere = try doc.mutate("healthy", "\"mine\"");
+    try std.testing.expectEqual(@as(u64, 1), elsewhere.timestamp);
+
+    std.debug.print(
+        \\
+        \\  #392 PROBE B: one op at the wire ceiling ({d})
+        \\    that path       FieldVersionExhausted   <- was: the WHOLE document
+        \\    unrelated path  writes at ts {d}, with {d} writes left
+        \\
+    , .{ MAX_TIMESTAMP, elsewhere.timestamp, MAX_TIMESTAMP - elsewhere.timestamp });
 }
 
 test "CrdtDoc: concurrent non-conflicting edits merge cleanly" {
@@ -1106,57 +1134,108 @@ test "#382 C-2 WITNESS: a failed replacement leaves the old value live, not free
 }
 
 // -----------------------------------------------------------------------------
-// #386 WITNESSES — the timestamp policy.
+// #392 WITNESSES — admission and versioning, superseding the #386 arms.
 //
-// RETRACTION, at the site that carried it. Two tests used to live here under
-// #382 C-3. One was titled "after a hostile timestamp, this peer can still be
-// heard" and planted `maxInt(i64)` — which was PAST the `1 << 62` cap in force
-// at the time, so it only ever exercised the refusal path. For every timestamp
-// that cap actually ADMITTED, its title was false, and the defect it claimed to
-// witness was live the whole time it was green. This is the "a gate can certify
-// a bound it never checks" class, found in my own test.
+// RETRACTION HISTORY, kept at the site that carries it because each layer was
+// green while the defect under it was live:
 //
-// The arms below plant AT and BELOW the acceptance ceiling, which is where the
-// old cap failed, and every one of them prints the clock it measured.
+//   #382 C-3 shipped two tests whose titles were false. One planted
+//   `maxInt(i64)` — PAST the `1 << 62` cap then in force — so it only ever
+//   exercised the refusal path, and for every timestamp that cap actually
+//   ADMITTED its claim was untested. "A gate can certify a bound it never
+//   checks", found in my own test.
+//
+//   #386 replaced them with ARMs 1-6 for a RELATIVE forward-jump bound. Those
+//   arms were sound about the code and wrong about the design: ARM 2 certified
+//   that one op could move a document-wide clock "only" by a constant, and ARM
+//   4 certified that the receiver-relative bound refused a far-ahead op. Both
+//   properties are now DELETED on purpose — the first was measuring a blast
+//   radius that should be zero, and the second was measuring the
+//   replica-dependence that broke convergence (PROBE A).
+//
+// The arms below assert the replacement properties, and each prints what it
+// measured rather than only asserting it.
 // -----------------------------------------------------------------------------
 
-test "#386 ARM 1: the admitted set is CLOSED under +1 at every clock the policy can reach" {
-    // The general statement of what #382 got wrong, and the arm that caught the
-    // first draft of #386 getting it wrong again. For each starting clock,
-    // admit the largest op the policy allows, then make a local write and put
-    // it through the REAL encoder and the REAL decoder — the same pair every
-    // other peer in the room runs.
+test "#392 PROBE A: admission is REPLICA-INDEPENDENT — same op, same verdict, any history" {
+    // The convergence property itself, and the direct replacement for #386 ARM
+    // 4. Under the receiver-relative bound, whether an op was admitted depended
+    // on what the receiver had already seen: a peer with a low clock refused
+    // ops that a peer with a high clock accepted. Two honest peers therefore
+    // applied different subsets of ONE delivered set and diverged permanently.
     //
-    // "The clock is a sensible number" is NOT the claim. "What this peer emits
-    // next, its own room still accepts" is, and only a round-trip can say so.
-    // The first draft passed an absolute acceptance ceiling and failed right
-    // here, on the last row.
+    // Same delivered set, deliberately unequal histories, identical outcome.
     const allocator = std.testing.allocator;
 
-    const starts = [_]u64{
-        0,
-        1_000_000,
-        MAX_TIMESTAMP / 2,
-        // Deliberately at the far end: a peer walked to within a hair of the
-        // wire ceiling by ~2^31 admitted ops. Even here it must still emit
-        // something decodable.
-        MAX_TIMESTAMP - MAX_FORWARD_JUMP - 10,
+    // A far-ahead op. Under #386 this was refused by any peer whose clock sat
+    // more than MAX_FORWARD_JUMP (2^32) below it, and accepted by any peer
+    // above — the same bytes, two verdicts.
+    const far_ahead: u64 = 1 << 40;
+    const op = CrdtOp{
+        .path = "k",
+        .value = "\"far\"",
+        .timestamp = far_ahead,
+        .peer_id = .{0x44} ** 16,
     };
 
-    for (starts, 1..) |start, row| {
+    // Peer FRESH has seen nothing. Peer BUSY has a long local history on an
+    // unrelated path, which is exactly what used to move its admission bound.
+    var fresh = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer fresh.deinit();
+    var busy = CrdtDoc.initWithPeerId(allocator, .{0x02} ** 16);
+    defer busy.deinit();
+    for (0..64) |_| _ = try busy.mutate("unrelated", "\"churn\"");
+
+    const fresh_took = try fresh.applyRemoteOp(op);
+    const busy_took = try busy.applyRemoteOp(op);
+
+    std.debug.print(
+        \\
+        \\  #392 PROBE A: one op (ts {d}), two histories
+        \\    fresh peer (no history)      admitted: {}  -> floor {d}
+        \\    busy  peer (64 local writes) admitted: {}  -> floor {d}
+        \\    unrelated floor on busy peer: {d}
+        \\
+    , .{
+        far_ahead, fresh_took,             fresh.versionFloor("k"),
+        busy_took, busy.versionFloor("k"), busy.versionFloor("unrelated"),
+    });
+
+    // Same verdict and same resulting state, which is what convergence means.
+    try std.testing.expect(fresh_took);
+    try std.testing.expect(busy_took);
+    try std.testing.expectEqual(fresh.versionFloor("k"), busy.versionFloor("k"));
+    try std.testing.expectEqualStrings(fresh.get("k").?, busy.get("k").?);
+
+    // Non-vacuity: the busy peer really did have a different history, so this
+    // is not passing because the two docs are identical.
+    try std.testing.expectEqual(@as(u64, 64), busy.versionFloor("unrelated"));
+    try std.testing.expectEqual(@as(u64, 0), fresh.versionFloor("unrelated"));
+}
+
+test "#392: what a peer emits, its own codec still accepts — at every reachable floor" {
+    // The surviving half of #386 ARM 1, re-pointed. The closure question ("is
+    // the admitted set closed under the increment?") is now trivially yes,
+    // because admission is the codec's whole range. What still needs measuring
+    // is the emit side: a field at ANY reachable floor must produce a write the
+    // real encoder and real decoder round-trip.
+    const allocator = std.testing.allocator;
+
+    const floors = [_]u64{ 0, 1_000_000, MAX_TIMESTAMP / 2, MAX_TIMESTAMP - 1 };
+
+    for (floors, 1..) |floor, row| {
         var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
         defer doc.deinit();
-        doc.clock = start;
 
-        const ts = start + MAX_FORWARD_JUMP; // the largest op admissible here
-        const changed = try doc.applyRemoteOp(.{
+        // Reach the floor the honest way — by adopting a remote op at it.
+        _ = try doc.applyRemoteOp(.{
             .path = "k",
-            .value = "\"poison\"",
-            .timestamp = ts,
+            .value = "\"seed\"",
+            .timestamp = floor,
             .peer_id = .{0x44} ** 16,
         });
 
-        const op = try doc.mutate("k2", "\"mine\"");
+        const op = try doc.mutate("k", "\"mine\"");
         const bytes = try encodeOpBytes(allocator, op);
         defer allocator.free(bytes);
         const decoded = try decodeOpBytes(allocator, bytes);
@@ -1164,59 +1243,19 @@ test "#386 ARM 1: the admitted set is CLOSED under +1 at every clock the policy 
         defer allocator.free(decoded.value);
 
         std.debug.print(
-            \\
-            \\  #386 ARM 1 row {d}: clock {d} -> admitted ts {d} (changed={})
-            \\    clock now      {d}
-            \\    local write ts {d}   round-trips: {}
-            \\    writes left    {d}
-            \\
-        , .{
-            row,       start,        ts,                                changed,
-            doc.clock, op.timestamp, decoded.timestamp == op.timestamp, MAX_TIMESTAMP - doc.clock,
-        });
+            "  #392 emit row {d}: floor {d} -> wrote ts {d}, round-trips: {}\n",
+            .{ row, floor, op.timestamp, decoded.timestamp == op.timestamp },
+        );
 
-        try std.testing.expect(changed);
+        try std.testing.expectEqual(floor + 1, op.timestamp);
         try std.testing.expectEqual(op.timestamp, decoded.timestamp);
         try std.testing.expectEqualStrings("\"mine\"", decoded.value);
     }
 }
 
-test "#386 ARM 2: ONE hostile op can no longer move the clock more than the jump bound" {
-    // The one-message brick, measured as the quantity it actually is. #382's
-    // answer to "how far can a single signed op drag this peer's clock?" was
-    // "all the way to the cap, from anywhere". It is now bounded by a constant.
-    const allocator = std.testing.allocator;
-
-    var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
-    defer doc.deinit();
-
-    const before = doc.clock;
-    // The most hostile op that will be admitted at all.
-    _ = try doc.applyRemoteOp(.{
-        .path = "k",
-        .value = "\"poison\"",
-        .timestamp = MAX_FORWARD_JUMP,
-        .peer_id = .{0x44} ** 16,
-    });
-    const moved = doc.clock - before;
-
-    // What #382 would have permitted from the same starting point.
-    const under_382: u64 = (1 << 62) + 1;
-
-    std.debug.print(
-        \\
-        \\  #386 ARM 2: worst single-op clock movement
-        \\    #382 permitted  {d}
-        \\    #386 permits    {d}
-        \\    ops to reach the wire ceiling: {d}
-        \\
-    , .{ under_382, moved, MAX_TIMESTAMP / MAX_FORWARD_JUMP });
-
-    try std.testing.expect(moved <= MAX_FORWARD_JUMP + 1);
-    try std.testing.expect(moved < under_382);
-}
-
-test "#386 ARM 3: a timestamp above the WIRE ceiling is refused on both boundaries" {
+test "#392: a timestamp above the WIRE ceiling is refused on both boundaries" {
+    // Survives #386 unchanged in substance — the wire ceiling is the one bound
+    // that was never the problem, and it is now the ONLY admission check.
     const allocator = std.testing.allocator;
 
     var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
@@ -1243,54 +1282,33 @@ test "#386 ARM 3: a timestamp above the WIRE ceiling is refused on both boundari
     try std.testing.expectError(error.InvalidOpBytes, decodeOpBytes(allocator, hostile));
 
     std.debug.print(
-        "\n  #386 ARM 3: ts={d} refused at both boundaries; clock unmoved at {d}\n",
-        .{ over, doc.clock },
+        "\n  #392: ts={d} refused at both boundaries; no field created ({d} fields)\n",
+        .{ over, doc.fields.count() },
     );
-    try std.testing.expectEqual(@as(u64, 0), doc.clock);
-}
+    // Non-vacuity: refusing left no partial state behind.
+    try std.testing.expectEqual(@as(usize, 0), doc.fields.count());
 
-test "#386 ARM 4: the forward-jump bound refuses a jump the ceiling alone would allow" {
-    // Defense in depth, measured separately from the ceiling so a regression in
-    // one cannot be masked by the other. This timestamp is comfortably ADMISSIBLE
-    // — the ceiling has no objection — and is refused purely for arriving too
-    // far ahead of where this peer's clock actually is.
-    const allocator = std.testing.allocator;
-
-    var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
-    defer doc.deinit();
-    _ = try doc.mutate("seed", "\"1\"");
-
-    const too_far = doc.clock + MAX_FORWARD_JUMP + 1;
-    try std.testing.expect(too_far <= MAX_TIMESTAMP); // not the wire ceiling's doing
-    try std.testing.expectError(error.TimestampTooFarAhead, doc.applyRemoteOp(.{
-        .path = "k",
-        .value = "\"x\"",
-        .timestamp = too_far,
-        .peer_id = .{0x44} ** 16,
-    }));
-
-    // Non-vacuity: one below the bound is ACCEPTED, so this is not passing by
-    // refusing everything.
-    const just_inside = doc.clock + MAX_FORWARD_JUMP;
+    // And the largest value the wire CAN carry is admitted, so this is not
+    // passing by refusing everything near the top.
     try std.testing.expect(try doc.applyRemoteOp(.{
         .path = "k",
         .value = "\"x\"",
-        .timestamp = just_inside,
+        .timestamp = MAX_TIMESTAMP,
         .peer_id = .{0x44} ** 16,
     }));
-
-    std.debug.print(
-        "\n  #386 ARM 4: jump bound {d} — refused {d}, accepted {d}, clock now {d}\n",
-        .{ MAX_FORWARD_JUMP, too_far, just_inside, doc.clock },
-    );
+    try std.testing.expectEqual(MAX_TIMESTAMP, doc.versionFloor("k"));
 }
 
-test "#386 ARM 5: a snapshot poisoned by the OLD 1<<62 cap now loads AND still writes" {
-    // The contagion arm. Under #382 this exact snapshot — the timestamp that
-    // build's own cap admitted — set a fresh peer's clock to a value its own
-    // `mutate` then refused forever, on an UNRELATED path, across a restart,
-    // for every peer that synced. That is the durable half of the defect, and
-    // it is the half a `.spf` on disk still carries today.
+test "#392: a snapshot poisoned by the OLD 1<<62 cap loads, and does not contaminate" {
+    // The contagion arm, and the property is now much stronger than #386's.
+    //
+    // Under #382 this exact snapshot set a fresh peer's CLOCK to a value its own
+    // `mutate` then refused forever, on unrelated paths, across a restart, for
+    // every peer that synced. #386 made the unrelated write succeed but at
+    // `OLD_CAP + 1` — the poison still set the version of every field in the
+    // document, it just no longer bricked them.
+    //
+    // Now the poisoned field's version is confined to the poisoned field.
     const allocator = std.testing.allocator;
 
     const OLD_CAP: u64 = 1 << 62;
@@ -1308,59 +1326,85 @@ test "#386 ARM 5: a snapshot poisoned by the OLD 1<<62 cap now loads AND still w
     try doc.loadSnapshot(poisoned);
 
     // Unrelated path — the field the attacker never touched.
-    const op = try doc.mutate("k2", "\"mine\"");
+    const elsewhere = try doc.mutate("k2", "\"mine\"");
+    // And the poisoned path itself is still writable: 2^62 is far below the
+    // wire ceiling, so it was never the data that was wrong.
+    const same_path = try doc.mutate("k", "\"mine\"");
 
     std.debug.print(
         \\
-        \\  #386 ARM 5: loaded a snapshot poisoned by the 1<<62 build
-        \\    field ts             {d}
-        \\    clock after the write {d}
-        \\    unrelated write ts    {d}  <- #382 returned error.ClockExhausted here
-        \\    writes left           {d}
+        \\  #392: loaded a snapshot poisoned by the 1<<62 build
+        \\    poisoned field ts  {d}
+        \\    unrelated write ts {d}   <- #382: ClockExhausted; #386: {d}
+        \\    same-path write ts {d}
+        \\    writes left on the poisoned path: {d}
         \\
-    , .{ OLD_CAP, doc.clock, op.timestamp, MAX_TIMESTAMP - doc.clock });
+    , .{ OLD_CAP, elsewhere.timestamp, OLD_CAP + 1, same_path.timestamp, MAX_TIMESTAMP - same_path.timestamp });
 
-    try std.testing.expectEqualStrings("\"poison\"", doc.get("k").?);
-    try std.testing.expectEqual(OLD_CAP + 1, op.timestamp);
-
-    // Counterfactual, computed rather than asserted: under the old absolute cap
-    // this clock was AT the emit-side refusal, so the write above could not
-    // have happened.
-    try std.testing.expect(doc.clock >= OLD_CAP);
-    std.debug.print(
-        "    under #382's cap ({d}) mutate refused at clock>={d}: {}\n",
-        .{ OLD_CAP, OLD_CAP, doc.clock >= OLD_CAP },
-    );
+    // The contagion is gone: the unrelated path starts from ITS OWN floor of 0.
+    try std.testing.expectEqual(@as(u64, 1), elsewhere.timestamp);
+    // The poisoned path advances from the adopted value, as LWW requires.
+    try std.testing.expectEqual(OLD_CAP + 1, same_path.timestamp);
 }
 
-test "#386 ARM 6: a snapshot timestamp inside the write reserve is DROPPED, not adopted" {
-    // The one timestamp class still refused on the snapshot side, and the
-    // reason it is dropped per-field rather than clamped: the bound is a
-    // constant, so every peer drops the same field and they still converge.
+test "#392 PROBE C: the snapshot round-trips its OWN output, at the wire ceiling" {
+    // RETRACTION AND REPLACEMENT of "#386 ARM 6: a snapshot timestamp inside
+    // the write reserve is DROPPED, not adopted". That arm was green and was
+    // certifying the defect: `MAX_SNAPSHOT_TIMESTAMP` sat 2^40 BELOW the wire
+    // ceiling, so `snapshot()` could emit a field that `loadSnapshot()` then
+    // silently discarded — a document that would not survive its own save/load
+    // cycle, and a joining peer that ended up with strictly less state than the
+    // host it synced from. Dropping is convergent only in the trivial sense
+    // that everyone loses the same data.
+    //
+    // The replacement property is the one that matters for a format which is
+    // both the sync payload and the on-disk project file: whatever this encoder
+    // can write, this decoder must read back unchanged.
     const allocator = std.testing.allocator;
 
-    var doc = CrdtDoc.initWithPeerId(allocator, .{0x55} ** 16);
-    defer doc.deinit();
+    var host = CrdtDoc.initWithPeerId(allocator, .{0x55} ** 16);
+    defer host.deinit();
 
-    const snap = try std.fmt.allocPrint(
-        allocator,
-        "{{\"bad\":{{\"v\":\"\\\"x\\\"\",\"ts\":{d},\"p\":\"{s}\"}}," ++
-            "\"good\":{{\"v\":\"\\\"y\\\"\",\"ts\":7,\"p\":\"{s}\"}}}}",
-        .{ MAX_SNAPSHOT_TIMESTAMP + 1, "ab" ** 16, "cd" ** 16 },
-    );
+    // A field at the highest version the wire can carry — the exact class the
+    // old reserve refused — beside an ordinary one.
+    _ = try host.applyRemoteOp(.{
+        .path = "ceiling",
+        .value = "\"top\"",
+        .timestamp = MAX_TIMESTAMP,
+        .peer_id = .{0xAB} ** 16,
+    });
+    _ = try host.mutate("ordinary", "\"mid\"");
+
+    const snap = try host.snapshot();
     defer allocator.free(snap);
 
-    try doc.loadSnapshot(snap);
+    var guest = CrdtDoc.initWithPeerId(allocator, .{0x66} ** 16);
+    defer guest.deinit();
+    try guest.loadSnapshot(snap);
 
     std.debug.print(
-        "\n  #386 ARM 6: over-ceiling field dropped={} sibling survived={s} clock={d}\n",
-        .{ doc.get("bad") == null, doc.get("good").?, doc.clock },
-    );
+        \\
+        \\  #392 PROBE C: save/load identity
+        \\    host  ceiling ts {d} value {s}
+        \\    guest ceiling ts {d} value {s}
+        \\    fields host {d} / guest {d}   (#386 dropped the ceiling field here)
+        \\
+    , .{
+        host.versionFloor("ceiling"),  host.get("ceiling").?,
+        guest.versionFloor("ceiling"), guest.get("ceiling") orelse "<DROPPED>",
+        host.fields.count(),           guest.fields.count(),
+    });
 
-    // Not passing by refusing the whole snapshot — the well-formed sibling is in.
-    try std.testing.expect(doc.get("bad") == null);
-    try std.testing.expectEqualStrings("\"y\"", doc.get("good").?);
-    try std.testing.expectEqual(@as(u64, 7), doc.clock);
+    // Nothing lost, and the versions are identical — a guest that syncs from a
+    // host now holds exactly what the host holds.
+    try std.testing.expectEqual(host.fields.count(), guest.fields.count());
+    try std.testing.expectEqual(MAX_TIMESTAMP, guest.versionFloor("ceiling"));
+    try std.testing.expectEqualStrings("\"top\"", guest.get("ceiling").?);
+    try std.testing.expectEqualStrings("\"mid\"", guest.get("ordinary").?);
+
+    // Non-vacuity: the ceiling field is genuinely at the top, so this is not
+    // passing on a value the old reserve would also have admitted.
+    try std.testing.expect(host.versionFloor("ceiling") > MAX_TIMESTAMP - (1 << 40));
 }
 
 test "#386 C-4: loadSnapshot is transactional — a bad snapshot leaves the document intact" {
@@ -1371,18 +1415,18 @@ test "#386 C-4: loadSnapshot is transactional — a bad snapshot leaves the docu
     var doc = CrdtDoc.initWithPeerId(allocator, .{0x66} ** 16);
     defer doc.deinit();
     _ = try doc.mutate("keep", "\"original\"");
-    const clock_before = doc.clock;
+    const version_before = doc.versionFloor("keep");
 
     try std.testing.expectError(error.SyntaxError, doc.loadSnapshot("{not json"));
     try std.testing.expectError(error.InvalidSnapshot, doc.loadSnapshot("[]"));
 
     std.debug.print(
-        "\n  #386 C-4: after 2 refused snapshots, field={s} clock={d} (was {d})\n",
-        .{ doc.get("keep") orelse "<GONE>", doc.clock, clock_before },
+        "\n  #386 C-4: after 2 refused snapshots, field={s} version={d} (was {d})\n",
+        .{ doc.get("keep") orelse "<GONE>", doc.versionFloor("keep"), version_before },
     );
 
     try std.testing.expectEqualStrings("\"original\"", doc.get("keep").?);
-    try std.testing.expectEqual(clock_before, doc.clock);
+    try std.testing.expectEqual(version_before, doc.versionFloor("keep"));
 }
 
 test "#386 C-4: loadSnapshot survives being handed a slice the document itself owns" {
@@ -1403,8 +1447,8 @@ test "#386 C-4: loadSnapshot survives being handed a slice the document itself o
     try doc.loadSnapshot(aliased);
 
     std.debug.print(
-        "  #386 C-4: aliased loadSnapshot ok — a={s} clock={d}\n",
-        .{ doc.get("a").?, doc.clock },
+        "  #386 C-4: aliased loadSnapshot ok — a={s} version={d}\n",
+        .{ doc.get("a").?, doc.versionFloor("a") },
     );
     try std.testing.expectEqualStrings("\"1\"", doc.get("a").?);
 }
