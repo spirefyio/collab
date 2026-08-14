@@ -1758,11 +1758,23 @@ pub const CollabManager = struct {
                     //    that must not relay. An OOM here made guests apply an
                     //    op the authoritative host had dropped, with no
                     //    anti-entropy pass to notice or repair it.
-                    //  - #386's forward-jump bound makes this sharper still:
-                    //    admission is now relative to each peer's clock, so
-                    //    peers CAN legitimately disagree. Relaying only what
-                    //    the host accepted is what keeps the host's accepted
-                    //    set the one every guest sees.
+                    //  - RETRACTED BY #392, and the conclusion survives on the
+                    //    two premises above. This bullet used to read "#386's
+                    //    forward-jump bound makes this sharper still: admission
+                    //    is now relative to each peer's clock, so peers CAN
+                    //    legitimately disagree." That bound is DELETED.
+                    //    Admission is replica-independent by construction now —
+                    //    two peers holding the same delivered set admit exactly
+                    //    the same ops — which was the whole point, since a
+                    //    receiver-relative rule is what broke convergence
+                    //    (#392 PROBE A). So peers can no longer legitimately
+                    //    disagree about admission, and this bullet argued FROM
+                    //    the defect rather than for the fix.
+                    //
+                    //    Relay-after-apply is still right, for the reason above
+                    //    it: a host-local failure (OOM) is not a property of the
+                    //    op, and relaying past it hands guests an op the
+                    //    authoritative host does not hold.
                     //
                     // Note `changed == false` still relays: a losing LWW merge
                     // is a successful application, and the same op may win at a

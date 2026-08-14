@@ -7,7 +7,7 @@ This directory is the **transport layer** for Spirefy's real-time collaboration 
 - `manager.zig` — `CollabManager`: room lifecycle, peer connections, broadcast/receive plumbing.
 - `websocket.zig` — TLS WebSocket transport.
 - `crypto.zig` — room-key encryption (the shared symmetric key used by all peers in a room).
-- `crdt.zig` — LWW-Map CRDT primitives (registers keyed by namespaced path; merge rule: higher Lamport timestamp wins, tie → higher peer_id).
+- `crdt_lww_map.zig` — LWW-Map CRDT primitives (registers keyed by namespaced path; merge rule: the TOTAL order `(version, peer_id, value_bytes)`, most significant first). All three components are load-bearing: `(version, peer_id)` alone is a partial order, and two registers it ranks equal are settled by arrival order instead, which diverged two honest replicas holding the same delivered set (#393, measured). Versions are per-field — `field_floor + 1` — with no document-wide clock (#392).
 - `protocol.zig` — wire-format message types (join, leave, sync_state, op, etc.).
 - `session.zig` — per-peer connection state.
 - `bridge_handlers.zig` — bridge endpoints exposed to studio (and any other consumer).
