@@ -1434,26 +1434,7 @@ pub const CollabManager = struct {
                 else
                     std.mem.zeroes([16]u8);
                 if (std.mem.eql(u8, o.ch, "unified-model")) {
-                    if (self.inbound_op_fn) |cb| {
-                        // Extract peer_id from the LWW op for studio's
-                        // CrdtBridge fairness sub-quota. Fall back to
-                        // conn_peer_id, then zero.
-                        const op_peer = extractLwwPeerId(plaintext) orelse conn_peer_id;
-                        // CONTRACT: asserted CROSS-REPO by studio/tests/crdt-share-test.sh
-                        // REPLICATION=manual (regex 'collab: inbound op \(unified-model\)
-                        // → bridge.applyPeerOp payload_len=[0-9]+'). The studio smoke
-                        // greps this exact string from collab's log output. Do not
-                        // rename 'inbound op' or remove 'payload_len=' without coordinating
-                        // a studio test update.
-                        std.log.info(
-                            "collab: inbound op (unified-model) → bridge.applyPeerOp payload_len={d}",
-                            .{plaintext.len},
-                        );
-                        // B1: signer carried through so the bridge can
-                        // attribute the op to a verified Ed25519 key
-                        // (B6 audit log + B4 role ACL groundwork).
-                        cb(self.inbound_op_ctx.?, op_peer, o.signer, plaintext);
-                    }
+                    dispatchUnifiedModelOp(self, changed, plaintext, o.signer, conn_peer_id);
                 }
                 if (ch.on_remote_op) |cb| {
                     cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
@@ -1614,10 +1595,7 @@ pub const CollabManager = struct {
                     if (changed) any_changed = true;
 
                     if (std.mem.eql(u8, batch.ch, "unified-model")) {
-                        if (self.inbound_op_fn) |cb| {
-                            const op_peer = extractLwwPeerId(plaintext) orelse conn_peer_id;
-                            cb(self.inbound_op_ctx.?, op_peer, entry.signer, plaintext);
-                        }
+                        dispatchUnifiedModelOp(self, changed, plaintext, entry.signer, conn_peer_id);
                     }
                     if (ch.on_remote_op) |cb| {
                         cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
@@ -2382,28 +2360,71 @@ pub const CollabManager = struct {
 // hook).
 // =============================================================================
 
-fn extractLwwPeerId(op_bytes: []const u8) ?[16]u8 {
-    // Use a tiny stack allocator to JSON-parse just the `p` field.
-    // FixedBufferAllocator with 1 KiB is enough for any well-formed op.
-    var buf: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const aa = fba.allocator();
+/// Hand an APPLIED unified-model op to the studio's `CrdtBridge`.
+///
+/// Both live arms — the single `.op` and each entry of an `.ops` batch — go
+/// through here, because they had the same two defects and a second copy is how
+/// the second one survived (#145).
+///
+/// THE VALUE, NOT THE ENVELOPE. `plaintext` is the LWW wire op,
+/// `{"path","v","ts","p"}`; the callback's contract is the field VALUE, which is
+/// what the `.sync` replay arm has always passed (`iterateFields` hands the
+/// bridge `value` directly). The live arms passed `plaintext`, so the bridge's
+/// batch parse found no root `commands` array and returned
+/// `error.StructuralOpRefused` for EVERY live op. A reconnect replays the
+/// snapshot through the correct arm, which is exactly why the symptom reads as
+/// "the live peer is stale; reconnecting fixes it".
+///
+/// GATED ON `changed`. An op the CRDT rejected as an LWW loser is not a model
+/// change: forwarding it would submit a batch the actor has to execute, against
+/// a field some later write already superseded. `applyRemote`'s answer is the
+/// only thing that knows, and it was being discarded here.
+///
+/// The peer id comes off the decoded op rather than a second ad-hoc parse of the
+/// same bytes — one decode, one source. (This replaced `extractLwwPeerId`, whose
+/// only reason to exist was that parse.)
+fn dispatchUnifiedModelOp(
+    mgr: *CollabManager,
+    changed: bool,
+    plaintext: []const u8,
+    signer: ?[]const u8,
+    conn_peer_id: [16]u8,
+) void {
+    if (!changed) return;
+    const cb = mgr.inbound_op_fn orelse return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, aa, op_bytes, .{}) catch return null;
-    defer parsed.deinit();
+    const op = crdt_mod.decodeOpBytes(mgr.allocator, plaintext) catch |err| {
+        // Near-unreachable: `applyRemote` decodes the same bytes and would have
+        // failed first, leaving `changed` false. Loud anyway — reaching it means
+        // the two decoders disagree, which is worth knowing.
+        std.log.warn(
+            "collab: inbound unified-model op applied but did not decode ({s}); not forwarded",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    defer mgr.allocator.free(op.path);
+    defer mgr.allocator.free(op.value);
 
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => return null,
-    };
-    const p_val = obj.get("p") orelse return null;
-    const p_hex = switch (p_val) {
-        .string => |s| s,
-        else => return null,
-    };
-    var peer_id: [16]u8 = undefined;
-    _ = std.fmt.hexToBytes(&peer_id, p_hex) catch return null;
-    return peer_id;
+    // Prefer the op's own peer id; fall back to the connection's when the op
+    // carries none we can use. Studio's CrdtBridge keys its fairness sub-quota
+    // on this.
+    const op_peer = if (std.mem.allEqual(u8, &op.peer_id, 0)) conn_peer_id else op.peer_id;
+
+    // CONTRACT: asserted CROSS-REPO by studio/tests/crdt-share-test.sh
+    // REPLICATION=manual (regex 'collab: inbound op \(unified-model\)
+    // → bridge.applyPeerOp payload_len=[0-9]+'). The studio smoke greps this
+    // exact string from collab's log output. Do not rename 'inbound op' or
+    // remove 'payload_len=' without coordinating a studio test update.
+    // The NUMBER now reports the value's length rather than the envelope's,
+    // which is the payload the bridge actually receives; the regex is unchanged.
+    std.log.info(
+        "collab: inbound op (unified-model) → bridge.applyPeerOp payload_len={d}",
+        .{op.value.len},
+    );
+    // B1: signer carried through so the bridge can attribute the op to a
+    // verified Ed25519 key (B6 audit log + B4 role ACL groundwork).
+    cb(mgr.inbound_op_ctx.?, op_peer, signer, op.value);
 }
 
 // =============================================================================
@@ -3613,4 +3634,193 @@ test "B1: host-mode duplicate .join with different pubkey on live slot → refus
         &std.mem.zeroes([16]u8),
         &mgr.connections.items[1].peer_id,
     );
+}
+
+// =============================================================================
+// #145 WITNESSES — the live inbound path forwards the VALUE, gated on `changed`
+//
+// These measure the two halves of the fix in `dispatchUnifiedModelOp`. They
+// print what they measured rather than only asserting it, because the finding
+// they close was carried for a while on a reading of the code, and a reading is
+// not a measurement.
+//
+// The studio half of the pair — the real `CrdtBridge.applyPeerOp` refusing the
+// envelope and admitting the value — lives in studio/src/model/crdt_bridge.zig
+// under the same "#145 WITNESS" banner. Together they cover the whole chain;
+// neither alone does, because the dependency runs studio -> collab and collab
+// cannot see the bridge.
+// =============================================================================
+
+/// Capture for the witnesses below.
+///
+/// `payload` is DUPED. The callback contract is a synchronous borrow —
+/// `dispatchUnifiedModelOp` frees `op.value` the instant it returns, and
+/// studio's trampoline documents the same rule for `signer`. Storing the slice
+/// instead of a copy would read freed memory the moment the test looked at it.
+/// (`signer` is kept as a slice only because every caller here passes a
+/// string literal, which outlives the test.)
+const InboundCapture = struct {
+    allocator: std.mem.Allocator,
+    calls: usize = 0,
+    payload: ?[]u8 = null,
+    peer_id: [16]u8 = std.mem.zeroes([16]u8),
+    signer: ?[]const u8 = null,
+
+    fn deinit(self: *InboundCapture) void {
+        if (self.payload) |p| self.allocator.free(p);
+        self.payload = null;
+    }
+
+    fn onOp(ctx: *anyopaque, peer_id: [16]u8, signer: ?[]const u8, payload_value: []const u8) void {
+        const self: *InboundCapture = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.peer_id = peer_id;
+        self.signer = signer;
+        if (self.payload) |p| self.allocator.free(p);
+        self.payload = self.allocator.dupe(u8, payload_value) catch null;
+    }
+};
+
+/// True iff `bytes` is a JSON object carrying a root `commands` array.
+///
+/// This is studio's admission predicate, REPLICATED rather than called: the
+/// dependency direction is studio -> collab, so collab cannot import the
+/// bridge. The original is `batchContainsStructuralOp` in
+/// studio/src/model/crdt_bridge.zig, whose first act is
+/// `root.object.get("commands") orelse return true` — a missing `commands` is a
+/// refusal, and an LWW envelope never has one. The real predicate is exercised
+/// against these same two shapes by the studio-side witness.
+fn hasRootCommands(allocator: std.mem.Allocator, bytes: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+    const commands = root.get("commands") orelse return false;
+    return switch (commands) {
+        .array => true,
+        else => false,
+    };
+}
+
+test "#145 WITNESS: the live arm forwards the field VALUE, not the LWW envelope" {
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+
+    var capture = InboundCapture{ .allocator = allocator };
+    defer capture.deinit();
+    mgr.setInboundOpCallback(&capture, InboundCapture.onOp);
+
+    // What studio's bridge is contracted to receive: a command batch. Its root
+    // `commands` array is the only thing the admission check looks for.
+    const batch =
+        "{\"protocol\":\"spirefy.cmd.v1\",\"commands\":[" ++
+        "{\"op\":\"update\",\"entity\":\"operation\",\"target\":\"op-1\"," ++
+        "\"data\":{\"summary\":\"from a peer\"}}]}";
+
+    // What a peer actually puts on the wire: that value inside an LWW envelope.
+    // Built with the real encoder, so the test cannot drift from the format.
+    const op_peer: [16]u8 = .{0xAB} ** 16;
+    const envelope = try crdt_mod.encodeOpBytes(allocator, .{
+        .path = "model.operations.op-1",
+        .value = batch,
+        .timestamp = 7,
+        .peer_id = op_peer,
+    });
+    defer allocator.free(envelope);
+
+    dispatchUnifiedModelOp(&mgr, true, envelope, "signer-pubkey", std.mem.zeroes([16]u8));
+
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    const got = capture.payload orelse return error.TestExpectedForwardedPayload;
+
+    // Run the admission predicate over BOTH shapes and print both answers. The
+    // `false` on the envelope line is the defect this ticket closed; the `true`
+    // on the forwarded line is the fix.
+    const envelope_admits = hasRootCommands(allocator, envelope);
+    const forwarded_admits = hasRootCommands(allocator, got);
+    std.debug.print(
+        \\
+        \\  #145 measured at the collab seam:
+        \\    envelope  {d:>4} bytes  root-commands={:<5}  (what the live arms used to forward)
+        \\    forwarded {d:>4} bytes  root-commands={:<5}  (what they forward now)
+        \\    envelope  head: {s}
+        \\    forwarded head: {s}
+        \\
+    , .{
+        envelope.len,
+        envelope_admits,
+        got.len,
+        forwarded_admits,
+        envelope[0..@min(64, envelope.len)],
+        got[0..@min(64, got.len)],
+    });
+
+    try std.testing.expect(!envelope_admits);
+    try std.testing.expect(forwarded_admits);
+    try std.testing.expectEqualStrings(batch, got);
+
+    // The op's own peer id reaches the bridge (its per-peer fairness quota
+    // keys on it), and the verified signer rides along.
+    try std.testing.expectEqualSlices(u8, &op_peer, &capture.peer_id);
+    try std.testing.expectEqualStrings("signer-pubkey", capture.signer.?);
+}
+
+test "#145 WITNESS: an op the CRDT rejected as an LWW loser is not forwarded" {
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+
+    var capture = InboundCapture{ .allocator = allocator };
+    defer capture.deinit();
+    mgr.setInboundOpCallback(&capture, InboundCapture.onOp);
+
+    const envelope = try crdt_mod.encodeOpBytes(allocator, .{
+        .path = "model.operations.op-1",
+        .value = "{\"protocol\":\"spirefy.cmd.v1\",\"commands\":[]}",
+        .timestamp = 1,
+        .peer_id = .{0xCD} ** 16,
+    });
+    defer allocator.free(envelope);
+
+    // `changed = false` is `applyRemote`'s verdict: this op lost the LWW
+    // comparison and changed nothing. Forwarding it anyway would submit a batch
+    // the actor has to execute against a field a later write already won.
+    dispatchUnifiedModelOp(&mgr, false, envelope, "signer-pubkey", std.mem.zeroes([16]u8));
+
+    std.debug.print(
+        "\n  #145 loser-op gate: callback invocations = {d} (expected 0)\n",
+        .{capture.calls},
+    );
+    try std.testing.expectEqual(@as(usize, 0), capture.calls);
+    try std.testing.expect(capture.payload == null);
+}
+
+test "#145: an all-zero op peer_id falls back to the connection's" {
+    const allocator = std.testing.allocator;
+
+    var mgr = CollabManager.init(allocator);
+    defer mgr.deinit();
+
+    var capture = InboundCapture{ .allocator = allocator };
+    defer capture.deinit();
+    mgr.setInboundOpCallback(&capture, InboundCapture.onOp);
+
+    const envelope = try crdt_mod.encodeOpBytes(allocator, .{
+        .path = "model.operations.op-2",
+        .value = "{\"protocol\":\"spirefy.cmd.v1\",\"commands\":[]}",
+        .timestamp = 3,
+        .peer_id = std.mem.zeroes([16]u8),
+    });
+    defer allocator.free(envelope);
+
+    const conn_peer: [16]u8 = .{0xEF} ** 16;
+    dispatchUnifiedModelOp(&mgr, true, envelope, "signer-pubkey", conn_peer);
+
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqualSlices(u8, &conn_peer, &capture.peer_id);
 }
