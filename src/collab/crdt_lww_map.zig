@@ -147,7 +147,16 @@ pub const CrdtOp = struct {
 /// Nothing about an attacker's freedom to choose values is a weakness here.
 /// They may pick any value they like; they cannot make two DIFFERENT values
 /// compare equal, which is the only thing that broke convergence.
-pub const OrderingKey = struct {
+///
+/// Deliberately NOT `pub`: the necessity audit on this increment measured zero
+/// references outside this file, and unconsumed public surface is a finding
+/// rather than a feature. Nothing external decides an ordering — `manager.zig`
+/// delegates to `applyRemote` — so exposing the rule would only constrain
+/// future refactoring. The in-file tests reach it without `pub`. A sibling CRDT
+/// (`crdt_text.zig`, `crdt_blob.zig`) will state its OWN order rather than
+/// reuse this one, so widening it later would be a one-word change with a real
+/// consumer behind it.
+const OrderingKey = struct {
     timestamp: u64,
     peer_id: [16]u8,
     value: []const u8,
