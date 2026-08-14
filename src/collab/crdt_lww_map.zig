@@ -191,13 +191,22 @@ pub const CrdtDoc = struct {
 
     /// Apply a local mutation. Returns the CrdtOp to broadcast to peers.
     pub fn mutate(self: *CrdtDoc, path: []const u8, value: []const u8) !CrdtOp {
-        // #386, emit side. Now unreachable by construction rather than by
-        // assertion, and the arithmetic is the whole argument: every path that
-        // writes `clock` bounds it at `MAX_ADMISSIBLE_TIMESTAMP + 1`
-        // (`applyRemoteOp`) or `MAX_ADMISSIBLE_TIMESTAMP` (`loadSnapshot`), so
-        // at least `WRITE_HEADROOM - 1` increments always remain below
-        // `MAX_TIMESTAMP`. Under #382's single absolute cap this guard was one
-        // remote message away instead, which is the defect #386 records.
+        // #386 emit side, and #392 RETRACTS what this comment used to claim.
+        //
+        // It said this guard was "unreachable by construction" and justified
+        // that with two constants — `MAX_ADMISSIBLE_TIMESTAMP` and
+        // `WRITE_HEADROOM` — that DO NOT EXIST in this file. They were the
+        // first draft's names, deleted when the policy became relative, and the
+        // comment was never updated. So the change that retracted three false
+        // doc claims shipped a fourth. Found by the gate on bf4eaff.
+        //
+        // WHAT IS ACTUALLY TRUE, measured (#392 PROBE B): exhaustion is
+        // reachable. From a snapshot at `MAX_SNAPSHOT_TIMESTAMP`, 255 admitted
+        // forward jumps plus one op at the wire ceiling put the clock at
+        // 9223372036854775808 — one PAST `MAX_TIMESTAMP` — and every later
+        // local write returns `ClockExhausted`. The relative bound made the
+        // brick cost 256 signed ops instead of one message; it did not make it
+        // impossible, and this comment should never have said otherwise.
         //
         // Kept as a guard rather than an assert because the alternative at the
         // true wire ceiling is emitting bytes no peer — including a future self
@@ -253,9 +262,17 @@ pub const CrdtDoc = struct {
     /// Tracked as its own ticket; do not read the absence of "atomically" here
     /// as the absence of a known defect.
     pub fn mutateBatch(self: *CrdtDoc, mutations: []const Mutation) ![]CrdtOp {
-        // Preflight the clock for the whole batch. `MAX_TIMESTAMP - self.clock`
-        // is the exact number of further increments available, and computing it
-        // as a subtraction keeps it in range for any clock value.
+        // Preflight the clock for the whole batch, so `ClockExhausted` is an
+        // all-or-nothing answer rather than a committed prefix.
+        //
+        // #392 (gate HIGH): the ceiling check below is NOT redundant, and the
+        // comment that used to sit here — claiming the subtraction "keeps it in
+        // range for any clock value" — was false. `applyRemoteOp` can leave the
+        // clock at `MAX_TIMESTAMP + 1` (measured, PROBE B), and once it does,
+        // `MAX_TIMESTAMP - self.clock` UNDERFLOWS. In a safe build that is a
+        // panic inside a peer's message loop, reached even by an empty batch.
+        // Check the ceiling first; only then is the subtraction defined.
+        if (self.clock >= MAX_TIMESTAMP) return error.ClockExhausted;
         if (mutations.len > MAX_TIMESTAMP - self.clock) return error.ClockExhausted;
 
         const ops = try self.allocator.alloc(CrdtOp, mutations.len);
