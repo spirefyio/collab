@@ -1477,8 +1477,16 @@ pub const CollabManager = struct {
                 if (pre.readyOp()) |op| {
                     dispatchUnifiedModelOp(self, changed, op, o.signer, conn_peer_id);
                 }
-                if (ch.on_remote_op) |cb| {
-                    cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                // #382 M-1: gated on `changed`, which is what channel.zig's
+                // `RemoteOpFn` doc has always promised ("invoked after
+                // applyRemote returns true"). This is the same defect #145
+                // fixed for the legacy callback, left live on the generic hook
+                // because no default channel registers one today. Unreachable
+                // is not the same as correct.
+                if (changed) {
+                    if (ch.on_remote_op) |cb| {
+                        cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                    }
                 }
 
                 // Relay only if peers are allowed to write on this
@@ -1646,8 +1654,11 @@ pub const CollabManager = struct {
                     if (pre.readyOp()) |op| {
                         dispatchUnifiedModelOp(self, changed, op, entry.signer, conn_peer_id);
                     }
-                    if (ch.on_remote_op) |cb| {
-                        cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                    // #382 M-1, batch sibling — same gate, same reason.
+                    if (changed) {
+                        if (ch.on_remote_op) |cb| {
+                            cb(ch.on_remote_op_ctx.?, conn_peer_id, plaintext);
+                        }
                     }
                 }
                 if (any_changed) {

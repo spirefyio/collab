@@ -22,6 +22,7 @@
 const std = @import("std");
 const compat = @import("compat");
 const crdt_interface = @import("crdt_interface.zig");
+const peer_id_mod = @import("peer_id.zig");
 const CrdtInterface = crdt_interface.CrdtInterface;
 const OpBytes = crdt_interface.OpBytes;
 const SnapshotBytes = crdt_interface.SnapshotBytes;
@@ -41,6 +42,32 @@ pub const Mutation = struct {
     path: []const u8,
     value: []const u8,
 };
+
+/// Largest timestamp this CRDT will accept from a peer, load from a snapshot,
+/// or emit locally (#382 C-3).
+///
+/// THE CEILING. The wire writes `ts` as a bare JSON number and every decoder
+/// accepts only `std.json.Value.integer`, which tops out at `maxInt(i64)`
+/// (~9.22e18). A larger number parses as `.number_string` and is refused.
+///
+/// THE ATTACK. `applyRemoteOp` advances the clock to `max(clock, ts) + 1`. One
+/// signed op carrying a near-ceiling `ts` therefore drags the LOCAL clock to
+/// the top, and from then on this peer's own honest mutations encode a number
+/// nobody — including a future self reading its own snapshot — will accept.
+/// Permanent, silent, and triggered by a single message.
+///
+/// THE BOUND, and why it is not `maxInt(i64)`. Capping at the ceiling itself
+/// does not help: an op at exactly the ceiling still leaves the clock one past
+/// it. The cap has to sit far enough below that no single op and no realistic
+/// run of local mutations can reach the top. `1 << 62` (~4.61e18) leaves 2^62
+/// further increments of headroom — at one mutation per microsecond that is
+/// ~146,000 years — while still admitting every timestamp a real Lamport clock
+/// will ever hold.
+///
+/// Not a rate limit and not a clock-skew policy. It is the bound that keeps the
+/// wire format closed under its own arithmetic, enforced on BOTH sides: remote
+/// ops above it are refused, and `mutate` refuses to emit above it.
+pub const MAX_TIMESTAMP: u64 = 1 << 62;
 
 /// A CRDT operation — the unit of replication sent over the wire.
 pub const CrdtOp = struct {
@@ -89,6 +116,11 @@ pub const CrdtDoc = struct {
 
     /// Apply a local mutation. Returns the CrdtOp to broadcast to peers.
     pub fn mutate(self: *CrdtDoc, path: []const u8, value: []const u8) !CrdtOp {
+        // #382 C-3, emit side. Unreachable in any real run (see MAX_TIMESTAMP's
+        // headroom argument) — but if the clock ever did top out, emitting the
+        // op would produce bytes no peer can decode, which is strictly worse
+        // than refusing the write and saying so.
+        if (self.clock >= MAX_TIMESTAMP) return error.ClockExhausted;
         self.clock += 1;
 
         const owned_value = try self.allocator.dupe(u8, value);
@@ -131,17 +163,32 @@ pub const CrdtDoc = struct {
     /// Merge a remote operation. Returns true if local state changed.
     /// Implements LWW: higher timestamp wins; tie-break by peer_id (lexicographic).
     pub fn applyRemoteOp(self: *CrdtDoc, op: CrdtOp) !bool {
-        // Advance Lamport clock: max(local, remote) + 1
-        self.clock = @max(self.clock, op.timestamp) + 1;
+        // #382 C-3: refuse before touching the clock. The decoders reject an
+        // out-of-range `ts` at the wire boundary too; this is the invariant
+        // guard for the direct-call path, which tests and any future in-process
+        // caller take.
+        if (op.timestamp > MAX_TIMESTAMP) return error.TimestampOutOfRange;
+
+        // Advance Lamport clock: max(local, remote) + 1. Saturating: the bound
+        // above already keeps this in range, so `+|` can only matter after ~2^63
+        // local mutations — at which point pinning the clock is still better
+        // than a panic in a peer's message loop.
+        self.clock = @max(self.clock, op.timestamp) +| 1;
 
         if (self.fields.getPtr(op.path)) |existing| {
             if (!shouldReplace(existing.*, op)) {
                 return false; // Local value wins, no change
             }
-            // Replace value in-place (key stays the same, it's the same path)
+            // #382 C-2: allocate the replacement BEFORE freeing the old value.
+            // The other order left a freed pointer in the map whenever the dupe
+            // failed, because the error propagates out of a half-updated entry
+            // — a later read, snapshot, replace, or deinit then uses or
+            // double-frees it. `mutate` above already had this order; this arm
+            // was the odd one out.
+            const owned_value = try self.allocator.dupe(u8, op.value);
             self.allocator.free(existing.value);
             existing.* = CrdtField{
-                .value = try self.allocator.dupe(u8, op.value),
+                .value = owned_value,
                 .timestamp = op.timestamp,
                 .peer_id = op.peer_id,
             };
@@ -233,17 +280,22 @@ pub const CrdtDoc = struct {
                 .string => |s| s,
                 else => continue,
             };
+            // #382: a negative `ts` used to reach `@intCast` unguarded, which is
+            // illegal behaviour — a hostile snapshot took the whole process down
+            // in Debug/ReleaseSafe rather than dropping one field. The op
+            // decoder guarded this; the snapshot decoder did not. Found while
+            // verifying C-1's siblings, not reported by the gate.
             const ts: u64 = switch (ts_val) {
-                .integer => |i| @intCast(i),
+                .integer => |i| if (i < 0) continue else @intCast(i),
                 else => continue,
             };
+            if (ts > MAX_TIMESTAMP) continue; // C-3, snapshot side
             const peer_hex = switch (p_val) {
                 .string => |s| s,
                 else => continue,
             };
 
-            var peer_id: [16]u8 = undefined;
-            _ = std.fmt.hexToBytes(&peer_id, peer_hex) catch continue;
+            const peer_id = peer_id_mod.parseHex(peer_hex) catch continue;
 
             const owned_path = try self.allocator.dupe(u8, path);
             errdefer self.allocator.free(owned_path);
@@ -481,12 +533,14 @@ pub fn decodeOpBytes(allocator: std.mem.Allocator, bytes: []const u8) !CrdtOp {
         .integer => |i| if (i < 0) return error.InvalidOpBytes else @intCast(i),
         else => return error.InvalidOpBytes,
     };
+    // #382 C-3: reject at the wire boundary so an out-of-range timestamp never
+    // becomes a CrdtOp at all.
+    if (ts > MAX_TIMESTAMP) return error.InvalidOpBytes;
     const p_hex = switch (p_val) {
         .string => |s| s,
         else => return error.InvalidOpBytes,
     };
-    var peer_id: [16]u8 = undefined;
-    _ = std.fmt.hexToBytes(&peer_id, p_hex) catch return error.InvalidOpBytes;
+    const peer_id = peer_id_mod.parseHex(p_hex) catch return error.InvalidOpBytes;
 
     // Dup the borrowed strings into the caller's allocator so they
     // outlive the arena. `applyRemoteOp` will dupe them again into its
@@ -728,4 +782,170 @@ test "CrdtDoc: convergence on same-field conflict" {
     // Both should converge to the same value (BB > AA, so Bob wins)
     try std.testing.expectEqualStrings(doc_a.get("x").?, doc_b.get("x").?);
     try std.testing.expectEqualStrings("bob", doc_a.get("x").?);
+}
+
+// =============================================================================
+// #382 WITNESSES — hostile-input handling
+//
+// Every finding in #382 was CONFIRMED-BY-READING when filed. These make each
+// one executable, and print the measured value rather than only asserting it.
+// The peer-id half lives in peer_id.zig beside the parser it guards.
+// =============================================================================
+
+test "#382 C-2 WITNESS: a failed replacement leaves the old value live, not freed" {
+    // The defect: `free(existing.value)` ran BEFORE the fallible dupe, so an
+    // allocation failure propagated out of a half-updated entry, leaving a
+    // freed pointer in the map.
+    //
+    // The measurement has two halves and BOTH matter. The visible one is that
+    // the map still reads back its original value. The decisive one is silent:
+    // `deinit` below frees that value exactly once. Before the fix it had
+    // already been freed, so this test ended in a DOUBLE FREE and
+    // `std.testing.allocator` failed on it.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+
+    var doc = CrdtDoc.initWithPeerId(alloc, .{0x11} ** 16);
+    defer doc.deinit();
+
+    _ = try doc.applyRemoteOp(.{
+        .path = "k",
+        .value = "\"first\"",
+        .timestamp = 10,
+        .peer_id = .{0x11} ** 16,
+    });
+    try std.testing.expectEqualStrings("\"first\"", doc.get("k").?);
+
+    // Arm the allocator so the NEXT allocation fails. On the replace path that
+    // is precisely the dupe of the incoming value.
+    failing.fail_index = failing.alloc_index;
+
+    const result = doc.applyRemoteOp(.{
+        .path = "k",
+        .value = "\"second\"",
+        .timestamp = 20,
+        .peer_id = .{0x22} ** 16,
+    });
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(failing.has_induced_failure);
+
+    const after = doc.get("k") orelse return error.TestExpectedFieldPresent;
+    std.debug.print(
+        "\n  #382 C-2: replacement OOM'd; map still holds {s} ({d} bytes, readable)\n",
+        .{ after, after.len },
+    );
+    try std.testing.expectEqualStrings("\"first\"", after);
+}
+
+test "#382 C-3 WITNESS: a near-ceiling timestamp is refused at the wire boundary" {
+    const allocator = std.testing.allocator;
+
+    const hostile = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"k\",\"v\":\"\\\"x\\\"\",\"ts\":{d},\"p\":\"{s}\"}}",
+        .{ std.math.maxInt(i64), "ab" ** 16 },
+    );
+    defer allocator.free(hostile);
+
+    // Well-formed in every other respect — a real signer could have produced it.
+    try std.testing.expectError(error.InvalidOpBytes, decodeOpBytes(allocator, hostile));
+}
+
+test "#382 C-3 WITNESS: after a hostile timestamp, this peer can still be heard" {
+    // The defect was never "a bad op gets applied". It was that ONE op left the
+    // peer permanently unable to emit anything its own room would accept — so
+    // the witness has to end at a successful DECODE by the same decoder every
+    // other peer runs, not at an assertion about the clock.
+    const allocator = std.testing.allocator;
+
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x33} ** 16);
+    defer doc.deinit();
+
+    const hostile: CrdtOp = .{
+        .path = "k",
+        .value = "\"poison\"",
+        .timestamp = std.math.maxInt(i64),
+        .peer_id = .{0x44} ** 16,
+    };
+
+    // What the unguarded clock advance would have produced, printed as the
+    // counterfactual: a value the wire cannot carry.
+    const unguarded: u64 = @max(doc.clock, hostile.timestamp) +| 1;
+    std.debug.print(
+        \\
+        \\  #382 C-3 counterfactual:
+        \\    unguarded clock would be {d}
+        \\    JSON integer ceiling is  {d}
+        \\    still encodable?         {}
+        \\
+    , .{ unguarded, std.math.maxInt(i64), unguarded <= std.math.maxInt(i64) });
+    try std.testing.expect(unguarded > std.math.maxInt(i64));
+
+    try std.testing.expectError(error.TimestampOutOfRange, doc.applyRemoteOp(hostile));
+
+    // Now the part that proves the room is not split: a normal local write,
+    // through the REAL encoder, decoded by the REAL decoder.
+    const op = try doc.mutate("k", "\"mine\"");
+    const bytes = try encodeOpBytes(allocator, op);
+    defer allocator.free(bytes);
+
+    const decoded = try decodeOpBytes(allocator, bytes);
+    defer allocator.free(decoded.path);
+    defer allocator.free(decoded.value);
+
+    std.debug.print(
+        "  #382 C-3: after the hostile op, local ts={d} round-trips (decoded ts={d})\n",
+        .{ op.timestamp, decoded.timestamp },
+    );
+    try std.testing.expectEqual(op.timestamp, decoded.timestamp);
+    try std.testing.expectEqualStrings("\"mine\"", decoded.value);
+}
+
+test "#382 WITNESS: a snapshot's negative ts and short peer id are skipped, not fatal" {
+    // Found while verifying C-1's siblings, NOT reported by the gate. The op
+    // decoder guarded a negative `ts`; the snapshot decoder reached `@intCast`
+    // unguarded, which is illegal behaviour — a hostile snapshot took the whole
+    // process down in Debug rather than dropping one field.
+    const allocator = std.testing.allocator;
+
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x55} ** 16);
+    defer doc.deinit();
+
+    try doc.loadSnapshot(
+        "{\"neg\":{\"v\":\"\\\"a\\\"\",\"ts\":-1,\"p\":\"" ++ "cd" ** 16 ++ "\"}," ++
+            "\"shortp\":{\"v\":\"\\\"b\\\"\",\"ts\":5,\"p\":\"00\"}," ++
+            "\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}}",
+    );
+
+    std.debug.print(
+        "\n  #382 snapshot: neg-ts={any} short-p={any} well-formed={any}\n",
+        .{ doc.get("neg") != null, doc.get("shortp") != null, doc.get("ok") },
+    );
+
+    // Both hostile fields dropped; the well-formed one survives, so this is not
+    // passing by refusing the whole snapshot.
+    try std.testing.expect(doc.get("neg") == null);
+    try std.testing.expect(doc.get("shortp") == null);
+    try std.testing.expectEqualStrings("\"c\"", doc.get("ok").?);
+}
+
+test "#382 C-1 WITNESS: an op carrying a SHORT peer id is refused by the decoder" {
+    // The `decodeOpBytes` call site, distinct from the snapshot one above and
+    // from peer_id.zig's parser tests. All three exist because the defect was
+    // four copies of one mistake, and closing three of four is how it comes
+    // back.
+    const allocator = std.testing.allocator;
+
+    const hostile = "{\"path\":\"k\",\"v\":\"\\\"x\\\"\",\"ts\":5,\"p\":\"00\"}";
+    try std.testing.expectError(error.InvalidOpBytes, decodeOpBytes(allocator, hostile));
+
+    const empty = "{\"path\":\"k\",\"v\":\"\\\"x\\\"\",\"ts\":5,\"p\":\"\"}";
+    try std.testing.expectError(error.InvalidOpBytes, decodeOpBytes(allocator, empty));
+
+    // Not passing by refusing everything: the well-formed sibling decodes.
+    const good = "{\"path\":\"k\",\"v\":\"\\\"x\\\"\",\"ts\":5,\"p\":\"" ++ "ab" ** 16 ++ "\"}";
+    const op = try decodeOpBytes(allocator, good);
+    defer allocator.free(op.path);
+    defer allocator.free(op.value);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xAB} ** 16), &op.peer_id);
 }

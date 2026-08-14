@@ -22,6 +22,7 @@ pub const crdt_text = @import("crdt_text.zig"); // STUB (NotImplemented) — see
 pub const crdt_blob = @import("crdt_blob.zig"); // STUB (NotImplemented) — see file docstring
 pub const channel = @import("channel.zig");
 pub const protocol = @import("protocol.zig");
+pub const peer_id = @import("peer_id.zig");
 pub const crypto = @import("crypto.zig");
 pub const identity = @import("identity");
 pub const websocket = @import("websocket.zig");

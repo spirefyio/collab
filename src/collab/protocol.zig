@@ -92,6 +92,7 @@
 const std = @import("std");
 const channel_mod = @import("channel.zig");
 const identity_mod = @import("identity");
+const peer_id_mod = @import("peer_id.zig");
 
 /// Wire protocol version emitted by this build.
 pub const PROTOCOL_VERSION: u32 = 4;
@@ -460,8 +461,10 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
         const room = getStr(obj, "room") orelse return error.MissingField;
         const name = getStr(obj, "name") orelse return error.MissingField;
         const peer_hex = getStr(obj, "peer") orelse return error.MissingField;
-        var peer_id: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&peer_id, peer_hex) catch return error.InvalidPeerId;
+        // #382 C-1: this id becomes the connection's tracked identity AND the
+        // key of `peer_pubkeys`, so a short `"peer"` used to hand an attacker
+        // an unpredictable map key made of undefined stack bytes.
+        const peer_id = peer_id_mod.parseHex(peer_hex) catch return error.InvalidPeerId;
 
         // suite_prefs: REQUIRED on join under pv:3+. The host needs the
         // joiner's supported suite list to negotiate. Empty array →
@@ -550,8 +553,8 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !ParseResult {
 
     if (std.mem.eql(u8, t, "leave")) {
         const peer_hex = getStr(obj, "peer") orelse return error.MissingField;
-        var peer_id: [16]u8 = undefined;
-        _ = std.fmt.hexToBytes(&peer_id, peer_hex) catch return error.InvalidPeerId;
+        // #382 C-1, third of four copies. `.leave` evicts by this id.
+        const peer_id = peer_id_mod.parseHex(peer_hex) catch return error.InvalidPeerId;
         return .{
             .msg = .{ .leave = .{ .peer_id = peer_id } },
             .parsed = parsed,
@@ -1222,4 +1225,43 @@ test "B1: decode under failing allocator — no leaks at every fail point" {
             // free is needed beyond the deinit on the success branch).
         }
     }
+}
+
+// =============================================================================
+// #382 C-1 WITNESSES — the two protocol-side peer-id call sites
+//
+// One test per CALL SITE, not just for the parser. peer_id.zig proves
+// `parseHex` refuses a short id; these prove `decode` actually routes through
+// it. That distinction is the whole lesson of #381: a helper can be correct
+// while nothing calls it.
+// =============================================================================
+
+test "#382 C-1: a join carrying a SHORT peer id is refused" {
+    const allocator = testing.allocator;
+
+    // Hand-built rather than round-tripped through `encode`, because `encode`
+    // takes a [16]u8 and cannot express the malformed shape an attacker sends.
+    // Even-length and valid hex, so `std.fmt.hexToBytes` accepts it and writes
+    // 1 byte, leaving 15 bytes of the tracked connection identity undefined.
+    const hostile =
+        "{\"t\":\"join\",\"pv\":4,\"room\":\"ABCD-1234\",\"name\":\"Mallory\"," ++
+        "\"peer\":\"00\",\"suite_prefs\":[\"aes-gcm-v1\"],\"pubkey\":\"" ++
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}";
+
+    try testing.expectError(error.InvalidPeerId, decode(allocator, hostile));
+}
+
+test "#382 C-1: a leave carrying a SHORT peer id is refused" {
+    const allocator = testing.allocator;
+    const hostile = "{\"t\":\"leave\",\"peer\":\"aabb\"}";
+    try testing.expectError(error.InvalidPeerId, decode(allocator, hostile));
+}
+
+test "#382 C-1: an empty peer id is refused on both arms" {
+    // The worst case of the four: zero bytes written, all 16 undefined.
+    const allocator = testing.allocator;
+    try testing.expectError(
+        error.InvalidPeerId,
+        decode(allocator, "{\"t\":\"leave\",\"peer\":\"\"}"),
+    );
 }
