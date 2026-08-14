@@ -450,6 +450,36 @@ pub const CrdtDoc = struct {
     /// Staging fixes all three at once: every read from `parsed` — and every
     /// dupe out of it — completes while `data` is still live, and the old state
     /// is destroyed only in the commit block, which cannot fail.
+    ///
+    /// #392 STRICT: a malformed field refuses the WHOLE snapshot rather than
+    /// being skipped, and the previous skip-and-continue behaviour is retracted.
+    ///
+    /// The argument is about convergence, not tidiness. A snapshot is how a
+    /// joining peer adopts the host's state, and the host retains every field it
+    /// sent. If the guest silently drops one it could not parse, the two hold
+    /// different documents from the first instant of the session — and with no
+    /// anti-entropy anywhere in this transport (`manager.zig` drops an op on any
+    /// error and never retries), nothing will ever repair it. Skipping is
+    /// convergent only in the vacuous sense that every peer loses the same data;
+    /// it is not convergent with the peer that still has it.
+    ///
+    /// Refusing is safe here precisely because the load is already transactional:
+    /// the document is untouched, so the caller can stay on the state it has and
+    /// report a failed sync, which is a recoverable situation. Silently holding
+    /// less than the host is not.
+    ///
+    /// SCOPE, recorded because I got this wrong once and told a reviewer so:
+    /// there is NO salvage counterpart, because nothing writes a CRDT snapshot
+    /// to disk. Verified rather than assumed — collab's only disk I/O is the
+    /// identity keypair, and studio's `.spf` persists the unified-model envelope
+    /// (PROJ-1), not this format. A `salvageSnapshot` entry point would be a
+    /// public surface with zero consumers. If `.spf` ever embeds a CRDT snapshot,
+    /// that is when a lenient disk path earns its place — with a report of every
+    /// skipped path, a recovered copy, and the original left untouched.
+    ///
+    /// Unknown EXTRA keys inside a field object remain ignored; only invalid
+    /// REQUIRED register data is refused. Extension-tolerance and
+    /// corruption-tolerance are different things.
     pub fn loadSnapshot(self: *CrdtDoc, data: []const u8) !void {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, data, .{});
         defer parsed.deinit();
@@ -473,25 +503,29 @@ pub const CrdtDoc = struct {
             const path = entry.key_ptr.*;
             const field_obj = switch (entry.value_ptr.*) {
                 .object => |o| o,
-                else => continue,
+                else => return error.InvalidSnapshot,
             };
 
-            const v_val = field_obj.get("v") orelse continue;
-            const ts_val = field_obj.get("ts") orelse continue;
-            const p_val = field_obj.get("p") orelse continue;
+            const v_val = field_obj.get("v") orelse return error.InvalidSnapshot;
+            const ts_val = field_obj.get("ts") orelse return error.InvalidSnapshot;
+            const p_val = field_obj.get("p") orelse return error.InvalidSnapshot;
 
             const value = switch (v_val) {
                 .string => |s| s,
-                else => continue,
+                else => return error.InvalidSnapshot,
             };
             // #382: a negative `ts` used to reach `@intCast` unguarded, which is
             // illegal behaviour — a hostile snapshot took the whole process down
             // in Debug/ReleaseSafe rather than dropping one field. The op
             // decoder guarded this; the snapshot decoder did not. Found while
             // verifying C-1's siblings, not reported by the gate.
+            //
+            // The GUARD is what mattered and it is unchanged; #392 only changes
+            // what happens after it fires — refuse the snapshot instead of
+            // dropping the field. Both are memory-safe; only one is convergent.
             const ts: u64 = switch (ts_val) {
-                .integer => |i| if (i < 0) continue else @intCast(i),
-                else => continue,
+                .integer => |i| if (i < 0) return error.InvalidSnapshot else @intCast(i),
+                else => return error.InvalidSnapshot,
             };
             // #392 DELETED the `ts > MAX_SNAPSHOT_TIMESTAMP` drop that used to
             // sit here. That bound was BELOW the wire ceiling, so this decoder
@@ -501,10 +535,10 @@ pub const CrdtDoc = struct {
             // that parses at all is one this peer can re-encode.
             const peer_hex = switch (p_val) {
                 .string => |s| s,
-                else => continue,
+                else => return error.InvalidSnapshot,
             };
 
-            const peer_id = peer_id_mod.parseHex(peer_hex) catch continue;
+            const peer_id = peer_id_mod.parseHex(peer_hex) catch return error.InvalidSnapshot;
 
             const owned_path = try self.allocator.dupe(u8, path);
             errdefer self.allocator.free(owned_path);
@@ -1453,32 +1487,73 @@ test "#386 C-4: loadSnapshot survives being handed a slice the document itself o
     try std.testing.expectEqualStrings("\"1\"", doc.get("a").?);
 }
 
-test "#382 WITNESS: a snapshot's negative ts and short peer id are skipped, not fatal" {
-    // Found while verifying C-1's siblings, NOT reported by the gate. The op
-    // decoder guarded a negative `ts`; the snapshot decoder reached `@intCast`
-    // unguarded, which is illegal behaviour — a hostile snapshot took the whole
-    // process down in Debug rather than dropping one field.
+test "#392: a snapshot with ONE malformed field is refused WHOLE — nothing commits" {
+    // RECLASSIFIED from "#382 WITNESS: a snapshot's negative ts and short peer
+    // id are skipped, not fatal".
+    //
+    // The #382 finding was a MEMORY-SAFETY defect: a negative `ts` reached
+    // `@intCast` unguarded and took the process down in Debug rather than being
+    // handled. That guard is intact and these arms still exercise it — what
+    // changed is the DISPOSITION after it fires.
+    //
+    // Skipping was wrong for a reason #382 was not looking at. A host retains
+    // every field it encoded; a guest that silently drops one it could not parse
+    // holds a different document from the first instant of the session, and
+    // nothing in this transport ever repairs that (`manager.zig` drops on error
+    // and never retries). Refusing keeps the guest on a state it can still
+    // reconcile from, which is recoverable; holding silently less is not.
     const allocator = std.testing.allocator;
 
     var doc = CrdtDoc.initWithPeerId(allocator, .{0x55} ** 16);
     defer doc.deinit();
+    _ = try doc.mutate("prior", "\"kept\"");
 
-    try doc.loadSnapshot(
-        "{\"neg\":{\"v\":\"\\\"a\\\"\",\"ts\":-1,\"p\":\"" ++ "cd" ** 16 ++ "\"}," ++
-            "\"shortp\":{\"v\":\"\\\"b\\\"\",\"ts\":5,\"p\":\"00\"}," ++
-            "\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}}",
-    );
+    const cases = [_]struct { name: []const u8, snap: []const u8 }{
+        .{
+            .name = "negative ts",
+            .snap = "{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}," ++
+                "\"neg\":{\"v\":\"\\\"a\\\"\",\"ts\":-1,\"p\":\"" ++ "cd" ** 16 ++ "\"}}",
+        },
+        .{
+            .name = "short peer id",
+            .snap = "{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}," ++
+                "\"shortp\":{\"v\":\"\\\"b\\\"\",\"ts\":5,\"p\":\"00\"}}",
+        },
+        .{
+            .name = "missing ts",
+            .snap = "{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}," ++
+                "\"nots\":{\"v\":\"\\\"a\\\"\",\"p\":\"" ++ "cd" ** 16 ++ "\"}}",
+        },
+        .{
+            .name = "value not a string",
+            .snap = "{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}," ++
+                "\"numv\":{\"v\":5,\"ts\":1,\"p\":\"" ++ "cd" ** 16 ++ "\"}}",
+        },
+        .{
+            .name = "field not an object",
+            .snap = "{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}," ++
+                "\"scalar\":42}",
+        },
+    };
 
-    std.debug.print(
-        "\n  #382 snapshot: neg-ts={any} short-p={any} well-formed={any}\n",
-        .{ doc.get("neg") != null, doc.get("shortp") != null, doc.get("ok") },
-    );
+    for (cases) |c| {
+        try std.testing.expectError(error.InvalidSnapshot, doc.loadSnapshot(c.snap));
+        // Transactional: the pre-existing document survives every refusal, and
+        // the WELL-FORMED sibling in the same snapshot did not sneak in — which
+        // is the half that makes "whole-reject" mean what it says.
+        try std.testing.expectEqualStrings("\"kept\"", doc.get("prior").?);
+        try std.testing.expect(doc.get("ok") == null);
+        std.debug.print(
+            "  #392 strict snapshot: {s} -> refused whole; prior intact, sibling absent\n",
+            .{c.name},
+        );
+    }
 
-    // Both hostile fields dropped; the well-formed one survives, so this is not
-    // passing by refusing the whole snapshot.
-    try std.testing.expect(doc.get("neg") == null);
-    try std.testing.expect(doc.get("shortp") == null);
+    // NON-VACUITY: the same snapshot with the malformed member removed loads,
+    // so this is not passing by refusing everything.
+    try doc.loadSnapshot("{\"ok\":{\"v\":\"\\\"c\\\"\",\"ts\":7,\"p\":\"" ++ "ef" ** 16 ++ "\"}}");
     try std.testing.expectEqualStrings("\"c\"", doc.get("ok").?);
+    std.debug.print("  #392 strict snapshot: the clean sibling-only snapshot LOADS (non-vacuity)\n", .{});
 }
 
 test "#382 C-1 WITNESS: an op carrying a SHORT peer id is refused by the decoder" {
