@@ -111,7 +111,9 @@ pub const Mutation = struct {
 /// encoding rather than a policy choice, which is exactly what makes it safe to
 /// admit against: it is identical on every replica, so it cannot make two peers
 /// disagree about which ops were delivered.
-pub const MAX_TIMESTAMP: u64 = std.math.maxInt(i64);
+/// Module-private: both the necessity audit and the #392 gate independently
+/// measured zero references outside this file.
+const MAX_TIMESTAMP: u64 = std.math.maxInt(i64);
 
 /// A CRDT operation — the unit of replication sent over the wire.
 pub const CrdtOp = struct {
@@ -285,9 +287,24 @@ pub const CrdtDoc = struct {
             try self.fields.put(owned_path, field);
         }
 
+        // #392 gate HIGH-5, CONFIRMED BY MEASUREMENT: this used to return the
+        // CALLER's `value` slice. When that slice aliased the register being
+        // replaced — `doc.mutate(k, doc.get(k).?)`, which is an obvious thing to
+        // write — the free above had already released it, so the returned op
+        // pointed at freed storage. Measured by comparing addresses rather than
+        // dereferencing: `op.value.ptr == freed stored.ptr` was `true`.
+        //
+        // Returning the document's own copy is never worse and sometimes much
+        // better: when the input aliased, `owned_value` is the live replacement;
+        // when it did not, both are live and identical in content.
+        //
+        // BORROW CONTRACT: `value` and `path` in the returned op are borrowed
+        // from this document and stay valid until the next mutation of THIS
+        // path. Encode or broadcast before mutating again. Every current caller
+        // (`vtableApplyLocal`) encodes immediately.
         return CrdtOp{
             .path = path,
-            .value = value,
+            .value = owned_value,
             .timestamp = version,
             .peer_id = self.peer_id,
         };
@@ -301,7 +318,9 @@ pub const CrdtDoc = struct {
     /// returned slice leaked on any error, and a clock that ran out part-way
     /// through committed a prefix and then refused the rest. Both are now
     /// impossible: the clock is checked for the WHOLE batch before the first
-    /// mutation lands, so `ClockExhausted` is an all-or-nothing answer.
+    /// mutation lands, so `FieldVersionExhausted` is an all-or-nothing answer.
+    /// (#392 gate LOW-9: this line named the deleted document clock and
+    /// `ClockExhausted` until the gate caught it. Exhaustion is per-field.)
     ///
     /// What remains, stated rather than implied: an allocation failure inside
     /// `mutate` still commits the mutations before it while returning an error,
@@ -315,20 +334,35 @@ pub const CrdtDoc = struct {
         // Preflight every field the batch touches, so `FieldVersionExhausted`
         // stays an all-or-nothing answer rather than a committed prefix.
         //
-        // Deliberately CONSERVATIVE: each path is checked as though the entire
-        // batch targeted it. Exact per-path counts would need a map allocation
-        // in order to admit a batch that cannot occur in practice — a field
-        // only reaches the wire ceiling by adopting a hostile remote op, since
-        // local writes advance it one at a time.
-        //
         // The ceiling check is FIRST and is not redundant: without it the
         // subtraction underflows for a field already at or past the ceiling,
-        // which in a safe build is a panic inside a peer's message loop. That
-        // was a real #392 finding against the previous document-wide form.
+        // which in a safe build is a panic inside a peer's message loop.
+        //
+        // #392 gate MED-6, CONFIRMED BY MEASUREMENT, and it REFUTES a claim
+        // this comment used to make. The previous form charged every path for
+        // the WHOLE batch and called the over-refusal unreachable "in practice".
+        // It is reachable through one admitted remote op: put `k` at
+        // `MAX_TIMESTAMP - 1`, then submit `{k, x}`. Both writes fit — `k`
+        // reaches the ceiling, `x` reaches 1 — and the old check refused the
+        // batch because `1 < 2`. Measured refusing with FieldVersionExhausted.
+        //
+        // The exact count is now used, with an O(1) fast path so the common
+        // case does not pay for it: a path with at least `mutations.len` of
+        // headroom cannot be exhausted by this batch no matter how many of the
+        // mutations target it, so no counting is needed. The O(n) inner walk
+        // runs only for a path within one batch-length of the wire ceiling,
+        // which requires a hostile op to arrange in the first place.
         for (mutations) |m| {
             const floor = self.versionFloor(m.path);
             if (floor >= MAX_TIMESTAMP) return error.FieldVersionExhausted;
-            if (MAX_TIMESTAMP - floor < mutations.len) return error.FieldVersionExhausted;
+            const headroom = MAX_TIMESTAMP - floor;
+            if (headroom >= mutations.len) continue;
+
+            var writes_to_this_path: u64 = 0;
+            for (mutations) |other| {
+                if (std.mem.eql(u8, other.path, m.path)) writes_to_this_path += 1;
+            }
+            if (headroom < writes_to_this_path) return error.FieldVersionExhausted;
         }
 
         const ops = try self.allocator.alloc(CrdtOp, mutations.len);
@@ -341,7 +375,9 @@ pub const CrdtDoc = struct {
     }
 
     /// Merge a remote operation. Returns true if local state changed.
-    /// Implements LWW: higher timestamp wins; tie-break by peer_id (lexicographic).
+    /// Implements LWW through the TOTAL order `(timestamp, peer_id, value_bytes)`
+    /// — see `OrderingKey`. (#392 gate LOW-9: this line documented only the
+    /// first two components, i.e. the partial order that #393 replaced.)
     pub fn applyRemoteOp(self: *CrdtDoc, op: CrdtOp) !bool {
         // The ONLY admission check, and it is an invariant rather than a
         // policy. `std.json` decodes `.integer` as i64, so a decoded op cannot
@@ -561,19 +597,76 @@ pub const CrdtDoc = struct {
             });
         }
 
-        // Commit. Every fallible step is above this line; nothing below can
-        // fail, so the document is either fully replaced or fully untouched.
-        // The free loop is spelled out rather than delegated to `clearAll`
-        // because this path replaces the map wholesale instead of emptying it,
-        // and `clearAndFree` followed by `deinit` would be two teardowns of one
-        // allocation to save one line.
-        var old = self.fields.iterator();
-        while (old.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.value);
+        // Reserve the worst case — every staged path being new — while failure
+        // is still safe. This is the LAST fallible step, and it is what lets
+        // the merge below use `putAssumeCapacity` and therefore be infallible.
+        try self.fields.ensureUnusedCapacity(staged.count());
+
+        // Commit: MERGE the staged registers into the live map through the
+        // total order, rather than replacing the map wholesale.
+        //
+        // #392 gate CRITICAL-1, CONFIRMED BY MEASUREMENT. Wholesale replacement
+        // made this the one state-bearing path that did NOT consult
+        // `OrderingKey.order`, so the same two inputs in opposite orders left
+        // two replicas in different states:
+        //
+        //     snapshot then op -> "O" (version 2)
+        //     op then snapshot -> "S" (version 1)
+        //     DIVERGED: true
+        //
+        // Reachable through the real transport, and the comment that looks like
+        // it prevents this is on the wrong side: `manager.zig:2110`'s "sync is
+        // the one-shot bootstrap state per channel" describes the SEND path.
+        // The accept arm has no re-sync guard at all — it checks guest-mode and
+        // host-connection, then loads unconditionally, and its own comment
+        // anticipates repeats ("additional channel syncs from the same host
+        // call setConnected idempotently"). A second sync therefore lands over
+        // whatever the guest applied in between.
+        //
+        // Merging is also the semantically correct reading of a snapshot: it is
+        // a SET OF REGISTERS, each carrying its own version, not an opaque
+        // document image. At a genuine join the local map is empty and merge
+        // and replace coincide, so nothing about bootstrap changes.
+        //
+        // A local-only field survives, which is correct: it is a write this
+        // peer made that the host has not relayed back yet. Deletion still
+        // propagates, because a delete is an empty VALUE carrying a version
+        // rather than an absence — so the host's tombstone competes and wins on
+        // the order like any other register.
+        //
+        // Security is unchanged. The #387 role checks (guest-mode only, host
+        // connection only) are upstream in `manager.zig` and untouched; a
+        // hostile host that could previously erase guest state can now only win
+        // the fields where its version is higher — which is weakly less power,
+        // never more.
+        //
+        // Nothing below this line can fail, so the document is either fully
+        // merged or fully untouched.
+        var it_staged = staged.iterator();
+        while (it_staged.next()) |entry| {
+            const path = entry.key_ptr.*;
+            const incoming = entry.value_ptr.*;
+
+            if (self.fields.getPtr(path)) |existing| {
+                const wins = OrderingKey.ofField(incoming)
+                    .order(OrderingKey.ofField(existing.*)) == .gt;
+                if (wins) {
+                    self.allocator.free(existing.value);
+                    existing.* = incoming;
+                } else {
+                    // The local register wins; the staged one is discarded.
+                    self.allocator.free(incoming.value);
+                }
+                // The staged KEY is always redundant when the path already
+                // exists — the map keeps its original key allocation.
+                self.allocator.free(path);
+            } else {
+                // New path: the map adopts both staged allocations. This cannot
+                // fail because the capacity was reserved above.
+                self.fields.putAssumeCapacity(path, incoming);
+            }
         }
-        self.fields.deinit();
-        self.fields = staged;
+        staged.deinit();
     }
 
     /// Export the merged CRDT state as a flat JSON object: {"path": "value", ...}
@@ -1210,10 +1303,17 @@ test "#392 PROBE A: admission is REPLICA-INDEPENDENT — same op, same verdict, 
     // Same delivered set, deliberately unequal histories, identical outcome.
     const allocator = std.testing.allocator;
 
-    // A far-ahead op. Under #386 this was refused by any peer whose clock sat
-    // more than MAX_FORWARD_JUMP (2^32) below it, and accepted by any peer
-    // above — the same bytes, two verdicts.
-    const far_ahead: u64 = 1 << 40;
+    // #392 gate LOW-7, CONFIRMED: this arm used to plant `1 << 40`, which the
+    // old `2^32` forward-jump rule refused at BOTH histories (2^40 - 2^32
+    // exceeds 0 and 64 alike). The test still failed against the old code, but
+    // for the weaker reason "acceptance was not unconditional" rather than the
+    // reason its own prose claims — that two replicas reach OPPOSITE verdicts.
+    // A witness whose title is stronger than what it exercises is the exact
+    // class this file keeps finding, and here it was mine.
+    //
+    // `2^32 + 1` straddles the old boundary instead: `2^32 + 1 - 2^32 = 1`,
+    // which is `> 0` (fresh peer REFUSES) and not `> 64` (busy peer ACCEPTS).
+    const far_ahead: u64 = (1 << 32) + 1;
     const op = CrdtOp{
         .path = "k",
         .value = "\"far\"",
@@ -1773,4 +1873,188 @@ test "#393: replaying an already-merged op reports no change (CrdtInterface cont
     try std.testing.expect(!second);
     try std.testing.expect(!third);
     try std.testing.expectEqualStrings("\"v\"", doc.get("k").?);
+}
+
+// -----------------------------------------------------------------------------
+// #392 GATE WITNESSES — findings confirmed by measurement, then closed.
+//
+// Each arm below existed as a scratch probe first, printed a value that proved
+// the defect, and only then became a permanent regression test. None was
+// accepted on the strength of the gate's prose.
+// -----------------------------------------------------------------------------
+
+test "#392 gate C1: a snapshot MERGES through the total order, in either arrival order" {
+    // CONFIRMED BY MEASUREMENT, then fixed. `loadSnapshot` replaced the map
+    // wholesale, making it the one state-bearing path that did not consult
+    // `OrderingKey.order`. Measured before the fix:
+    //
+    //     snapshot then op -> "O" (version 2)
+    //     op then snapshot -> "S" (version 1)
+    //     DIVERGED: true
+    //
+    // Reachability was confirmed separately by reading `manager.zig`: the
+    // "sync is the one-shot bootstrap" comment is on the SEND path, and the
+    // accept arm has NO re-sync guard — it checks guest-mode and host-conn,
+    // then loads, and its own comment anticipates repeats. A second sync
+    // therefore lands over whatever the guest applied in between.
+    const allocator = std.testing.allocator;
+
+    const hex = "ab" ** 16;
+    const snap = "{\"k\":{\"v\":\"\\\"S\\\"\",\"ts\":1,\"p\":\"" ++ hex ++ "\"}}";
+    const op = CrdtOp{ .path = "k", .value = "\"O\"", .timestamp = 2, .peer_id = .{0xAB} ** 16 };
+
+    var snap_first = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer snap_first.deinit();
+    try snap_first.loadSnapshot(snap);
+    _ = try snap_first.applyRemoteOp(op);
+
+    var op_first = CrdtDoc.initWithPeerId(allocator, .{0x02} ** 16);
+    defer op_first.deinit();
+    _ = try op_first.applyRemoteOp(op);
+    try op_first.loadSnapshot(snap);
+
+    std.debug.print(
+        \\
+        \\  #392 gate C1: same two inputs, opposite arrival order
+        \\    snapshot then op -> {s} (version {d})
+        \\    op then snapshot -> {s} (version {d})
+        \\    DIVERGED: {}
+        \\
+    , .{
+        snap_first.get("k").?,                                        snap_first.versionFloor("k"),
+        op_first.get("k").?,                                          op_first.versionFloor("k"),
+        !std.mem.eql(u8, snap_first.get("k").?, op_first.get("k").?),
+    });
+
+    try std.testing.expectEqualStrings(snap_first.get("k").?, op_first.get("k").?);
+    // Non-vacuity: they agree on the value the ORDER names — the ts=2 op — not
+    // by both taking the snapshot or both dropping the field.
+    try std.testing.expectEqualStrings("\"O\"", snap_first.get("k").?);
+    try std.testing.expectEqual(@as(u64, 2), op_first.versionFloor("k"));
+}
+
+test "#392 gate C1: a merging snapshot keeps a local-only field and still applies deletes" {
+    // The two properties that make MERGE correct rather than merely different.
+    // A local-only register is this peer's own unrelayed write and must
+    // survive; a delete must still propagate, which it does because a delete is
+    // an empty VALUE carrying a version rather than an absence.
+    const allocator = std.testing.allocator;
+    const hex = "cd" ** 16;
+
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc.deinit();
+    _ = try doc.mutate("mine", "\"local\"");
+    _ = try doc.mutate("shared", "\"local\"");
+
+    // Host snapshot: does not mention `mine`; tombstones `shared` at a higher
+    // version than the local write (which is 1).
+    try doc.loadSnapshot(
+        "{\"shared\":{\"v\":\"\",\"ts\":9,\"p\":\"" ++ hex ++ "\"}}",
+    );
+
+    std.debug.print(
+        "\n  #392 gate C1: local-only field survives = {}; host tombstone applied = {}\n",
+        .{ doc.get("mine") != null, doc.get("shared") == null },
+    );
+
+    try std.testing.expectEqualStrings("\"local\"", doc.get("mine").?);
+    try std.testing.expect(doc.get("shared") == null); // tombstoned
+    try std.testing.expectEqual(@as(u64, 9), doc.versionFloor("shared"));
+}
+
+test "#392 gate H5: the op returned by mutate does not alias freed storage" {
+    // CONFIRMED BY MEASUREMENT, then fixed. `mutate` returned the CALLER's
+    // slice; when that slice aliased the register being replaced, the free had
+    // already released it. Measured by comparing addresses rather than
+    // dereferencing: `op.value.ptr == freed stored.ptr` was `true`.
+    const allocator = std.testing.allocator;
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc.deinit();
+
+    _ = try doc.mutate("k", "\"old\"");
+    const stored = doc.get("k").?;
+    const stale_ptr = stored.ptr;
+
+    // The aliasing call: hand the document its own value back.
+    const op = try doc.mutate("k", stored);
+
+    std.debug.print(
+        "\n  #392 gate H5: op.value aliases the freed pointer: {} — and reads back as {s}\n",
+        .{ op.value.ptr == stale_ptr, op.value },
+    );
+
+    // The op must NOT point at the released allocation...
+    try std.testing.expect(op.value.ptr != stale_ptr);
+    // ...and must be readable, which is the half that would trap under the
+    // testing allocator if this regressed.
+    try std.testing.expectEqualStrings("\"old\"", op.value);
+    try std.testing.expectEqualStrings("\"old\"", doc.get("k").?);
+}
+
+test "#392 gate MED-6: a batch that fits is ACCEPTED even next to the wire ceiling" {
+    // CONFIRMED BY MEASUREMENT, then fixed. The old preflight charged every
+    // path for the whole batch and refused this, while claiming in a comment
+    // that the situation could not occur in practice. It occurs after exactly
+    // one admitted remote op.
+    const allocator = std.testing.allocator;
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc.deinit();
+
+    _ = try doc.applyRemoteOp(.{
+        .path = "k",
+        .value = "\"seed\"",
+        .timestamp = MAX_TIMESTAMP - 1,
+        .peer_id = .{0xAB} ** 16,
+    });
+
+    const fits = [_]Mutation{
+        .{ .path = "k", .value = "\"a\"" }, // k: MAX-1 -> MAX, exactly fits
+        .{ .path = "x", .value = "\"b\"" }, // x: 0 -> 1
+    };
+    const ops = try doc.mutateBatch(&fits);
+    defer allocator.free(ops);
+
+    std.debug.print(
+        "\n  #392 gate MED-6: batch ACCEPTED — k at {d} (ceiling {d}), x at {d}\n",
+        .{ doc.versionFloor("k"), MAX_TIMESTAMP, doc.versionFloor("x") },
+    );
+    try std.testing.expectEqual(MAX_TIMESTAMP, doc.versionFloor("k"));
+    try std.testing.expectEqual(@as(u64, 1), doc.versionFloor("x"));
+
+    // NON-VACUITY: a batch that genuinely does NOT fit is still refused. `k` is
+    // now AT the ceiling, so any further write to it must fail.
+    const does_not_fit = [_]Mutation{.{ .path = "k", .value = "\"c\"" }};
+    try std.testing.expectError(
+        error.FieldVersionExhausted,
+        doc.mutateBatch(&does_not_fit),
+    );
+    std.debug.print("  #392 gate MED-6: a batch that does NOT fit is still refused\n", .{});
+}
+
+test "#392 gate LOW-8: delete then recreate keeps the version monotonic (the real PROBE E)" {
+    // CONFIRMED, then closed. `versionFloor`'s doc claimed this was "measured
+    // (#392 PROBE E)". PROBE E was a scratch probe from the design
+    // consultation and was never landed, so the code cited a measurement that
+    // did not exist in the tree — my own unbacked claim, of exactly the kind
+    // this file keeps retracting. This is that measurement, for real.
+    const allocator = std.testing.allocator;
+    var doc = CrdtDoc.initWithPeerId(allocator, .{0x01} ** 16);
+    defer doc.deinit();
+
+    const write = try doc.mutate("k", "\"v1\"");
+    const tomb = try doc.mutate("k", ""); // delete is an empty VALUE
+    const again = try doc.mutate("k", "\"v2\"");
+
+    std.debug.print(
+        "\n  #392 gate LOW-8: write {d} -> tombstone {d} -> recreate {d}; register retained across delete: {}\n",
+        .{ write.timestamp, tomb.timestamp, again.timestamp, doc.fields.contains("k") },
+    );
+
+    try std.testing.expectEqual(@as(u64, 1), write.timestamp);
+    try std.testing.expectEqual(@as(u64, 2), tomb.timestamp);
+    try std.testing.expectEqual(@as(u64, 3), again.timestamp);
+    // The point of the claim: the register survives the delete, so the floor
+    // does not reset and a stale ts=2 op cannot resurrect the tombstone.
+    try std.testing.expect(doc.fields.contains("k"));
+    try std.testing.expectEqualStrings("\"v2\"", doc.get("k").?);
 }
