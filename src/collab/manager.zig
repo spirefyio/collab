@@ -4507,3 +4507,823 @@ test "#387 HIGH-13 WITNESS: a peer cannot evict another by naming its id in a le
     try std.testing.expect(victim_still_here);
     try std.testing.expect(victim_left);
 }
+
+// =============================================================================
+// W-COLLAB WC-1..WC-10 — witnesses for Kevin's 2026-09-10 question
+// =============================================================================
+//
+// Kevin asked, verbatim: "CRDT I thought was FULL.. I assumed it supported peer
+// mutations (e.g. change on one showed up/[m]utated other peers) AND it should
+// also support full TEAM capabilities. Lets be sure of that.. but ideally CRDT
+// is full.. e.g. the library collab/ should be fully baked/done and ready to
+// use and integrated for full mutations.. and it should support ANY data
+// type.. not JUST spirefy-core. Double check that."
+//
+// Project memory `crdt-is-a-priced-feature` requires a MEASURED witness for any
+// collab finding, not a reading. These ten tests are that measurement. Each one
+// stands up real CollabManagers on loopback TCP (real ws upgrade, real AEAD,
+// real Ed25519), drives the actual host/guest wire path, PRINTS the measured
+// values, and then asserts the CORRECT behaviour. So a witness is RED while the
+// defect it names exists and flips GREEN when it is fixed.
+//
+//   * WC-2 is the expected-GREEN control: it proves the harness itself works
+//     (independent registers DO propagate and the model IS told), so a RED WC-2
+//     would indict the test, not the library.
+//   * WC-1, WC-3..WC-10 assert the behaviour Kevin's question presumes ("full",
+//     "any data type", "full TEAM") and are predicted RED at pin ab130be.
+//   * No verdict rests on timing. The one ordering race (WC-1's concurrent
+//     write) is forced with a barrier — the host mutex, held so neither guest's
+//     op can be processed until both are generated — never with a sleep. Every
+//     negative ("did not arrive") is paired with a positive causal signal on
+//     the SAME connection: a later sentinel op, a state change, or a metric.
+//
+// The studio half of W-COLLAB (two ModelActors, the model-diff after concurrent
+// edits, the Save-resets-the-version defect) lives in studio and is owed
+// separately; collab cannot see the bridge, so neither half proves the whole
+// chain alone.
+
+const wc_step_ms: u64 = 5;
+const wc_deadline_ms: u64 = 5000;
+
+fn wcSleepStep() void {
+    compat.sleepNs(wc_step_ms * std.time.ns_per_ms);
+}
+
+fn wcState(mgr: *CollabManager) session_mod.SessionState {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    return mgr.session.state;
+}
+
+fn wcPeerCount(mgr: *CollabManager) usize {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    return mgr.session.peers.items.len;
+}
+
+fn wcConnectionCount(mgr: *CollabManager) usize {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    return mgr.connections.items.len;
+}
+
+fn wcFieldCount(mgr: *CollabManager) usize {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    return mgr.crdt_doc.fields.count();
+}
+
+fn wcHolds(mgr: *CollabManager, path: []const u8, value: []const u8) bool {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    const got = mgr.crdt_doc.get(path) orelse return false;
+    return std.mem.eql(u8, got, value);
+}
+
+/// The FIELD's own version at `path` (0 if absent). Reads `.timestamp`
+/// directly rather than `get`, so a tombstone (empty value) still reports its
+/// version — the witnesses need the register version, not the display value.
+fn wcVersion(mgr: *CollabManager, path: []const u8) u64 {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    const field = mgr.crdt_doc.fields.get(path) orelse return 0;
+    return field.timestamp;
+}
+
+/// Scan the capture for a delivery whose value equals `value`, considering
+/// only entries at or after index `first`. Held under the delivering
+/// manager's mutex, because `InboundCapture.onOp` runs inside that manager's
+/// `processMessage` — reading the list under any other lock would race the
+/// append.
+fn wcDeliveredSince(mgr: *CollabManager, capture: *const InboundCapture, first: usize, value: []const u8) bool {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    if (first > capture.items.items.len) return false;
+    for (capture.items.items[first..]) |d| {
+        if (std.mem.eql(u8, d.payload, value)) return true;
+    }
+    return false;
+}
+
+fn wcDelivered(mgr: *CollabManager, capture: *const InboundCapture, value: []const u8) bool {
+    return wcDeliveredSince(mgr, capture, 0, value);
+}
+
+fn wcDeliveryCount(mgr: *CollabManager, capture: *const InboundCapture) usize {
+    mgr.mutex.lockUncancelable(compat.io());
+    defer mgr.mutex.unlock(compat.io());
+    return capture.items.items.len;
+}
+
+fn wcWaitState(mgr: *CollabManager, want: session_mod.SessionState) bool {
+    var waited: u64 = 0;
+    while (waited < wc_deadline_ms) : (waited += wc_step_ms) {
+        if (wcState(mgr) == want) return true;
+        wcSleepStep();
+    }
+    return wcState(mgr) == want;
+}
+
+/// Wait until the session leaves `state`, returning the settled state (or
+/// `state` itself if the deadline expires while still there).
+fn wcWaitNot(mgr: *CollabManager, state: session_mod.SessionState) session_mod.SessionState {
+    var waited: u64 = 0;
+    while (waited < wc_deadline_ms) : (waited += wc_step_ms) {
+        const s = wcState(mgr);
+        if (s != state) return s;
+        wcSleepStep();
+    }
+    return wcState(mgr);
+}
+
+fn wcWaitPeerCount(mgr: *CollabManager, want: usize) bool {
+    var waited: u64 = 0;
+    while (waited < wc_deadline_ms) : (waited += wc_step_ms) {
+        if (wcPeerCount(mgr) == want) return true;
+        wcSleepStep();
+    }
+    return wcPeerCount(mgr) == want;
+}
+
+fn wcWaitHolds(mgr: *CollabManager, path: []const u8, value: []const u8) bool {
+    var waited: u64 = 0;
+    while (waited < wc_deadline_ms) : (waited += wc_step_ms) {
+        if (wcHolds(mgr, path, value)) return true;
+        wcSleepStep();
+    }
+    return wcHolds(mgr, path, value);
+}
+
+fn wcWaitDecryptFailures(mgr: *CollabManager, at_least: usize) bool {
+    var waited: u64 = 0;
+    while (waited < wc_deadline_ms) : (waited += wc_step_ms) {
+        if (mgr.getMetricsSnapshot().inbound_decrypt_failed >= at_least) return true;
+        wcSleepStep();
+    }
+    return mgr.getMetricsSnapshot().inbound_decrypt_failed >= at_least;
+}
+
+const WcRoom = struct {
+    code: [9]u8,
+    url_buf: [64]u8,
+    url_len: usize,
+    fn url(self: *const WcRoom) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
+
+/// Register the default channel, host a session on an ephemeral port, and
+/// return the room code plus a loopback ws:// URL a guest can dial.
+fn wcHost(host: *CollabManager, name: []const u8) !WcRoom {
+    try host.registerDefaultChannels();
+    const code_slice = try host.createSession(name, 0, null, .aes_gcm_v1);
+    var room: WcRoom = undefined;
+    @memcpy(&room.code, code_slice[0..9]);
+    const u = try std.fmt.bufPrint(&room.url_buf, "ws://127.0.0.1:{d}", .{host.currentPort()});
+    room.url_len = u.len;
+    return room;
+}
+
+/// Join `room` as a guest and wait for BOTH sides to agree the join landed:
+/// the host lists `host_roster_after` peers, and the guest reaches
+/// `.connected`. A distinct error for each half so a failure names which
+/// direction stalled.
+fn wcJoin(
+    guest: *CollabManager,
+    host: *CollabManager,
+    room: *const WcRoom,
+    name: []const u8,
+    host_roster_after: usize,
+) !void {
+    try guest.registerDefaultChannels();
+    try guest.joinSession(&room.code, room.url(), name);
+    if (!wcWaitPeerCount(host, host_roster_after)) return error.WcHostNeverListedTheGuest;
+    if (!wcWaitState(guest, .connected)) return error.WcGuestNeverConnected;
+}
+
+fn wcResultName(result: anyerror!void) []const u8 {
+    if (result) |_| return "ok" else |err| return @errorName(err);
+}
+
+test "W-COLLAB WC-1: two guests writing one key at once converge the register but not what their applications applied" {
+    const allocator = std.testing.allocator;
+
+    var host_cap = InboundCapture.init(allocator);
+    defer host_cap.deinit();
+    var host = CollabManager.init(allocator);
+    defer host.deinit();
+    host.setInboundOpCallback(&host_cap, InboundCapture.onOp);
+    const room = try wcHost(&host, "Host");
+
+    var g1_cap = InboundCapture.init(allocator);
+    defer g1_cap.deinit();
+    var g1 = CollabManager.init(allocator);
+    defer g1.deinit();
+    g1.setInboundOpCallback(&g1_cap, InboundCapture.onOp);
+    try wcJoin(&g1, &host, &room, "G1", 1);
+
+    var g2_cap = InboundCapture.init(allocator);
+    defer g2_cap.deinit();
+    var g2 = CollabManager.init(allocator);
+    defer g2.deinit();
+    g2.setInboundOpCallback(&g2_cap, InboundCapture.onOp);
+    try wcJoin(&g2, &host, &room, "G2", 2);
+
+    const key = "model/v42";
+    const batch_g1 = "{\"commands\":[\"edit made on G1\"]}";
+    const batch_g2 = "{\"commands\":[\"edit made on G2\"]}";
+
+    // Barrier: hold the host mutex so neither guest's op can be processed by
+    // the host until BOTH are generated. This forces the concurrent case (both
+    // at version 1) without any timing assumption.
+    host.mutex.lockUncancelable(compat.io());
+    const write_g1 = g1.mutate(key, batch_g1);
+    const write_g2 = g2.mutate(key, batch_g2);
+    const version_g1 = wcVersion(&g1, key);
+    const version_g2 = wcVersion(&g2, key);
+    host.mutex.unlock(compat.io());
+    try write_g1;
+    try write_g2;
+
+    // LWW total order is (timestamp, peer_id, value). Both ops carry ts=1, so
+    // the peer_id decides; value is never consulted.
+    const g1_wins = std.mem.order(u8, &g1.session.local_peer_id, &g2.session.local_peer_id) == .gt;
+    const winner_value = if (g1_wins) batch_g1 else batch_g2;
+
+    const registers_converged =
+        wcWaitHolds(&g1, key, winner_value) and
+        wcWaitHolds(&g2, key, winner_value) and
+        wcWaitHolds(&host, key, winner_value);
+
+    // What each guest's APPLICATION (model) actually applied: its own edit,
+    // plus whatever the bridge callback was handed. The LWW loser is never
+    // handed to the bridge (`if (!changed) return`), so the winner's guest is
+    // never told about the loser's edit.
+    const Applied = struct { g1: bool, g2: bool };
+    const g1_applied = Applied{ .g1 = true, .g2 = wcDelivered(&g1, &g1_cap, batch_g2) };
+    const g2_applied = Applied{ .g1 = wcDelivered(&g2, &g2_cap, batch_g1), .g2 = true };
+    const applications_agree = std.meta.eql(g1_applied, g2_applied);
+
+    std.debug.print(
+        \\
+        \\  WC-1: concurrent write to one key (winner = {s})
+        \\    precondition: g1 version={d}  g2 version={d}  (both 1 == concurrent)
+        \\    registers converged on the winner        = {}
+        \\    G1 model applied {{g1={}, g2={}}}
+        \\    G2 model applied {{g1={}, g2={}}}
+        \\    applications agree (models converged)     = {}   <- #457 F4
+        \\
+    , .{
+        if (g1_wins) "G1" else "G2",
+        version_g1,             version_g2,
+        registers_converged,
+        g1_applied.g1,          g1_applied.g2,
+        g2_applied.g1,          g2_applied.g2,
+        applications_agree,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), version_g1);
+    try std.testing.expectEqual(@as(u64, 1), version_g2);
+    try std.testing.expect(registers_converged);
+    // Predicted RED at ab130be: the registers converge, the models do not.
+    try std.testing.expect(applications_agree);
+
+    g2.leaveSession();
+    g1.leaveSession();
+    host.leaveSession();
+}
+
+test "W-COLLAB WC-2 (expected GREEN control): independent registers propagate and every model is told" {
+    const allocator = std.testing.allocator;
+
+    var host_cap = InboundCapture.init(allocator);
+    defer host_cap.deinit();
+    var host = CollabManager.init(allocator);
+    defer host.deinit();
+    host.setInboundOpCallback(&host_cap, InboundCapture.onOp);
+    const room = try wcHost(&host, "Host");
+
+    var g1_cap = InboundCapture.init(allocator);
+    defer g1_cap.deinit();
+    var g1 = CollabManager.init(allocator);
+    defer g1.deinit();
+    g1.setInboundOpCallback(&g1_cap, InboundCapture.onOp);
+    try wcJoin(&g1, &host, &room, "G1", 1);
+
+    var g2_cap = InboundCapture.init(allocator);
+    defer g2_cap.deinit();
+    var g2 = CollabManager.init(allocator);
+    defer g2.deinit();
+    g2.setInboundOpCallback(&g2_cap, InboundCapture.onOp);
+    try wcJoin(&g2, &host, &room, "G2", 2);
+
+    const v1 = "\"from-g1\"";
+    const v2 = "\"from-g2\"";
+    const v3 = "\"from-host\"";
+    try g1.mutate("model/v1", v1);
+    try g2.mutate("model/v2", v2);
+    try host.mutate("model/v3", v3);
+
+    const converged =
+        wcWaitHolds(&g1, "model/v1", v1) and wcWaitHolds(&g1, "model/v2", v2) and wcWaitHolds(&g1, "model/v3", v3) and
+        wcWaitHolds(&g2, "model/v1", v1) and wcWaitHolds(&g2, "model/v2", v2) and wcWaitHolds(&g2, "model/v3", v3) and
+        wcWaitHolds(&host, "model/v1", v1) and wcWaitHolds(&host, "model/v2", v2) and wcWaitHolds(&host, "model/v3", v3);
+
+    // Give the relays a moment to reach the bridge callbacks, then read.
+    const g1_got_v2 = wcDelivered(&g1, &g1_cap, v2);
+    const g1_got_v3 = wcDelivered(&g1, &g1_cap, v3);
+    const g2_got_v1 = wcDelivered(&g2, &g2_cap, v1);
+    const g2_got_v3 = wcDelivered(&g2, &g2_cap, v3);
+    const host_got_v1 = wcDelivered(&host, &host_cap, v1);
+    const host_got_v2 = wcDelivered(&host, &host_cap, v2);
+    const models_told =
+        g1_got_v2 and g1_got_v3 and g2_got_v1 and g2_got_v3 and host_got_v1 and host_got_v2;
+
+    std.debug.print(
+        \\
+        \\  WC-2 (control): three independent keys, three writers
+        \\    all three registers converged on all three peers = {}
+        \\    G1 model told of v2/v3 = {}/{}   G2 told of v1/v3 = {}/{}   host told of v1/v2 = {}/{}
+        \\
+    , .{ converged, g1_got_v2, g1_got_v3, g2_got_v1, g2_got_v3, host_got_v1, host_got_v2 });
+
+    try std.testing.expect(converged);
+    try std.testing.expect(models_told);
+
+    g2.leaveSession();
+    g1.leaveSession();
+    host.leaveSession();
+}
+
+test "W-COLLAB WC-3: a guest is knocked to idle when ANOTHER guest leaves, though its host link is alive" {
+    const allocator = std.testing.allocator;
+
+    var g1_cap = InboundCapture.init(allocator);
+    defer g1_cap.deinit();
+
+    var host = CollabManager.init(allocator);
+    defer host.deinit();
+    const room = try wcHost(&host, "Host");
+
+    var g1 = CollabManager.init(allocator);
+    defer g1.deinit();
+    g1.setInboundOpCallback(&g1_cap, InboundCapture.onOp);
+    try wcJoin(&g1, &host, &room, "G1", 1);
+
+    var g2 = CollabManager.init(allocator);
+    defer g2.deinit();
+    try wcJoin(&g2, &host, &room, "G2", 2);
+
+    // G1 learns about G2 via the host's relayed join; G2 is never told about
+    // the pre-existing G1, and neither guest lists the host.
+    const g1_saw_g2 = wcWaitPeerCount(&g1, 1);
+    const roster_host = wcPeerCount(&host);
+    const roster_g1 = wcPeerCount(&g1);
+    const roster_g2 = wcPeerCount(&g2);
+
+    g2.leaveSession();
+    _ = wcWaitPeerCount(&host, 1);
+    _ = wcWaitPeerCount(&g1, 0);
+    const g1_state_after = wcState(&g1);
+
+    // G1 believes it is offline, so its own write is refused...
+    const g1_offline_write = wcResultName(g1.mutate("model/v9", "\"g1-after\""));
+    // ...yet the host's write still reaches G1's CRDT over the same live TCP
+    // connection — the positive signal that "idle" is spurious.
+    try host.mutate("model/v10", "\"host-after\"");
+    const g1_got_host_write = wcWaitHolds(&g1, "model/v10", "\"host-after\"");
+
+    std.debug.print(
+        \\
+        \\  WC-3: rosters after both joins  host={d}  G1={d}  G2={d}   (2/1/0 predicted)
+        \\    G1 saw G2                                    = {}
+        \\    after G2 leaves, G1 state                    = {s}   (want .connected)
+        \\    G1's own write while "idle"                  = {s}
+        \\    host's later write still reached G1's CRDT   = {}
+        \\
+    , .{
+        roster_host,        roster_g1,           roster_g2,
+        g1_saw_g2,
+        @tagName(g1_state_after),
+        g1_offline_write,
+        g1_got_host_write,
+    });
+
+    try std.testing.expect(g1_saw_g2);
+    try std.testing.expect(g1_got_host_write);
+    // Predicted RED: a guest whose peer-roster empties is reset to idle even
+    // though it is still connected to the host.
+    try std.testing.expectEqual(session_mod.SessionState.connected, g1_state_after);
+
+    g1.leaveSession();
+    host.leaveSession();
+}
+
+test "W-COLLAB WC-4: the host admits a peer that presented the wrong room code" {
+    const allocator = std.testing.allocator;
+
+    var host = CollabManager.init(allocator);
+    defer host.deinit();
+    const room = try wcHost(&host, "Host");
+
+    // "ZZZZ-0000" is a valid 9-char shape that the generator can NEVER emit
+    // (0 is not in its alphabet), so it cannot collide with the real code.
+    const wrong_code = "ZZZZ-0000";
+
+    var uninvited = CollabManager.init(allocator);
+    defer uninvited.deinit();
+    try uninvited.registerDefaultChannels();
+    try uninvited.joinSession(wrong_code, room.url(), "Uninvited");
+
+    const admitted = wcWaitPeerCount(&host, 1);
+    // The uninvited peer derived its key from the WRONG code, so it cannot
+    // decrypt the host's sync — a metric, not a timing guess.
+    const failed_on_sync = wcWaitDecryptFailures(&uninvited, 1);
+    try host.mutate("model/v1", "\"secret\"");
+    const failed_on_op = wcWaitDecryptFailures(&uninvited, 2);
+    const uninvited_state = wcState(&uninvited);
+    const peers_json = try host.getPeersJson();
+    defer allocator.free(peers_json);
+
+    // Control: a correctly-coded peer joins. If the uninvited peer really
+    // holds a roster slot, the host now lists TWO.
+    var invited = CollabManager.init(allocator);
+    defer invited.deinit();
+    try wcJoin(&invited, &host, &room, "Invited", if (admitted) 2 else 1);
+    const roster_with_invited = wcPeerCount(&host);
+
+    std.debug.print(
+        \\
+        \\  WC-4: uninvited peer presented "{s}" (never a real code)
+        \\    host admitted it to the roster              = {}   (want false)
+        \\    uninvited decrypt-failed on sync / live op  = {} / {}
+        \\    uninvited session state                     = {s}   (stuck, never .connected)
+        \\    host roster after an invited peer also joins = {d}
+        \\    host getPeersJson = {s}
+        \\
+    , .{
+        wrong_code,
+        admitted,
+        failed_on_sync, failed_on_op,
+        @tagName(uninvited_state),
+        roster_with_invited,
+        peers_json,
+    });
+
+    try std.testing.expect(failed_on_sync);
+    try std.testing.expect(failed_on_op);
+    // Predicted RED: the host has no room-code admission check, so a peer with
+    // the wrong code still consumes a roster slot and forces encrypted sends.
+    try std.testing.expect(!admitted);
+
+    invited.leaveSession();
+    uninvited.leaveSession();
+    host.leaveSession();
+}
+
+test "W-COLLAB WC-5: the room code travels in cleartext in the join frame" {
+    const allocator = std.testing.allocator;
+
+    var observer = try ws.Server.init(.{ .port = 0 });
+    defer observer.deinit();
+    const obs_port = observer.getPort();
+
+    const WcObserved = struct {
+        server: *ws.Server,
+        allocator: std.mem.Allocator,
+        first_frame: ?[]const u8 = null,
+        got_stream: ?net.Stream = null,
+        fail: ?[]const u8 = null,
+        fn run(self: *@This()) void {
+            const stream = self.server.accept() catch |err| {
+                self.fail = @errorName(err);
+                return;
+            };
+            self.got_stream = stream;
+            const frame = ws.readFrame(self.allocator, stream) catch |err| {
+                self.fail = @errorName(err);
+                return;
+            };
+            self.first_frame = frame.payload;
+        }
+    };
+
+    var observed = WcObserved{ .server = &observer, .allocator = allocator };
+    // The observer must run concurrently: joinSession BLOCKS in ws.connect's
+    // upgrade handshake until someone accepts.
+    const obs_thread = try std.Thread.spawn(.{}, WcObserved.run, .{&observed});
+
+    var guest = CollabManager.init(allocator);
+    defer guest.deinit();
+    try guest.registerDefaultChannels();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}", .{obs_port});
+    const code = "QWER-7777";
+    // The observer is not a real host, so the guest will never get a welcome;
+    // we only need its first outbound frame (the join). Ignore the join result.
+    guest.joinSession(code, url, "Spy") catch {};
+    obs_thread.join();
+
+    var code_readable = false;
+    if (observed.first_frame) |frame| {
+        code_readable = std.mem.indexOf(u8, frame, code) != null;
+        std.debug.print(
+            \\
+            \\  WC-5: first on-the-wire frame the guest sent ({d} bytes)
+            \\    frame[0..{d}] = {s}
+            \\    room code readable in cleartext = {}   (want false)
+            \\
+        , .{ frame.len, @min(frame.len, 160), frame[0..@min(frame.len, 160)], code_readable });
+        allocator.free(frame);
+    } else {
+        std.debug.print("\n  WC-5: observer captured no frame (fail={s})\n", .{observed.fail orelse "none"});
+    }
+    if (observed.got_stream) |s| ws.closeStream(s);
+
+    guest.leaveSession();
+
+    try std.testing.expect(observed.first_frame != null);
+    // Predicted RED: the join envelope is a plaintext JSON text frame; only
+    // op/sync payloads are encrypted, so an on-path observer reads the code.
+    try std.testing.expect(!code_readable);
+}
+
+test "W-COLLAB WC-6: a legal-size op is accepted by the host but too large for the receiver's frame cap" {
+    const allocator = std.testing.allocator;
+
+    var host = CollabManager.init(allocator);
+    defer host.deinit();
+    const room = try wcHost(&host, "Host");
+
+    var guest = CollabManager.init(allocator);
+    defer guest.deinit();
+    try wcJoin(&guest, &host, &room, "Guest", 1);
+
+    const under = try allocator.alloc(u8, 500_000);
+    defer allocator.free(under);
+    @memset(under, 'u');
+    const over = try allocator.alloc(u8, 900_000);
+    defer allocator.free(over);
+    @memset(over, 'o');
+
+    try host.mutate("model/v1", under);
+    const under_arrived = wcWaitHolds(&guest, "model/v1", under);
+
+    const over_result = host.mutate("model/v2", over);
+    const over_accepted = if (over_result) |_| true else |_| false;
+    const over_arrived = wcWaitHolds(&guest, "model/v2", over);
+    const guest_state = wcWaitNot(&guest, .connected);
+    const host_roster = wcPeerCount(&host);
+
+    std.debug.print(
+        \\
+        \\  WC-6: op plaintext cap is ~1 MiB; the WS frame read cap is 1 MiB
+        \\    500 KB value arrived at the guest           = {}
+        \\    900 KB value accepted by the host           = {s}
+        \\    900 KB value arrived at the guest           = {}
+        \\    guest state after the oversize op           = {s}   (idle = torn down)
+        \\    host roster after                           = {d}
+        \\
+    , .{
+        under_arrived,
+        wcResultName(over_result),
+        over_arrived,
+        @tagName(guest_state),
+        host_roster,
+    });
+
+    try std.testing.expect(under_arrived);
+    // Predicted RED: base64 inflates the ciphertext 4/3, so an op that clears
+    // the ~1 MiB plaintext cap becomes a >1 MiB frame the receiver refuses,
+    // and refusing it disconnects the reader.
+    try std.testing.expect(!over_accepted or (over_arrived and guest_state == .connected));
+
+    guest.leaveSession();
+    host.leaveSession();
+}
+
+test "W-COLLAB WC-7: a peer cannot bootstrap into a room whose snapshot exceeds the frame cap" {
+    const allocator = std.testing.allocator;
+
+    const value = try allocator.alloc(u8, 1000);
+    defer allocator.free(value);
+    @memset(value, 'x');
+
+    const counts = [_]usize{ 600, 900 };
+    for (counts) |k| {
+        var host = CollabManager.init(allocator);
+        defer host.deinit();
+        const room = try wcHost(&host, "Host");
+
+        var kbuf: [24]u8 = undefined;
+        for (0..k) |i| {
+            const p = try std.fmt.bufPrint(&kbuf, "model/v{d}", .{i + 1});
+            try host.mutate(p, value);
+        }
+
+        host.mutex.lockUncancelable(compat.io());
+        const snap = host.crdt_doc.snapshot() catch null;
+        const snap_len = if (snap) |s| s.len else 0;
+        if (snap) |s| host.allocator.free(s);
+        host.mutex.unlock(compat.io());
+
+        var guest = CollabManager.init(allocator);
+        defer guest.deinit();
+        try guest.registerDefaultChannels();
+        try guest.joinSession(&room.code, room.url(), "Guest");
+        const final_state = wcWaitNot(&guest, .joining);
+        const guest_fields = wcFieldCount(&guest);
+
+        std.debug.print(
+            \\
+            \\  WC-7: host holds {d} fields, snapshot = {d} bytes
+            \\    guest final state = {s}   guest field count = {d}   (want .connected / {d})
+            \\
+        , .{ k, snap_len, @tagName(final_state), guest_fields, k });
+
+        // Predicted: 600 connects (control); 900 never does, because its sync
+        // frame exceeds the guest's 1 MiB read cap.
+        try std.testing.expectEqual(session_mod.SessionState.connected, final_state);
+        try std.testing.expectEqual(k, guest_fields);
+
+        guest.leaveSession();
+        host.leaveSession();
+    }
+}
+
+test "W-COLLAB WC-8: a batch over MAX_OPS_BATCH_LEN is applied locally but dropped whole by the receiver" {
+    const allocator = std.testing.allocator;
+
+    const sizes = [_]usize{ 200, 300 };
+    for (sizes, 0..) |n, i| {
+        var host = CollabManager.init(allocator);
+        defer host.deinit();
+        const room = try wcHost(&host, "Host");
+
+        var guest = CollabManager.init(allocator);
+        defer guest.deinit();
+        try wcJoin(&guest, &host, &room, "Guest", 1);
+
+        var path_store: [300][24]u8 = undefined;
+        var mutations: [300]Mutation = undefined;
+        for (0..n) |k| {
+            const p = try std.fmt.bufPrint(&path_store[k], "batch{d}/{d}", .{ i, k });
+            mutations[k] = .{ .path = p, .value = "{\"v\":1}" };
+        }
+        const batch_result = host.mutateBatch(mutations[0..n]);
+
+        // A single op AFTER the batch. TCP order guarantees the guest processes
+        // the batch frame first, so once the sentinel lands the batch's fate is
+        // decided — no timing assumption.
+        var sentinel_buf: [24]u8 = undefined;
+        const sentinel = try std.fmt.bufPrint(&sentinel_buf, "sentinel/{d}", .{i});
+        try host.mutate(sentinel, "{\"s\":1}");
+        const sentinel_seen = wcWaitHolds(&guest, sentinel, "{\"s\":1}");
+
+        var guest_held: usize = 0;
+        var host_held: usize = 0;
+        for (0..n) |k| {
+            if (wcHolds(&guest, mutations[k].path, "{\"v\":1}")) guest_held += 1;
+            if (wcHolds(&host, mutations[k].path, "{\"v\":1}")) host_held += 1;
+        }
+
+        std.debug.print(
+            \\
+            \\  WC-8: local batch of {d} (MAX_OPS_BATCH_LEN = {d})
+            \\    host mutateBatch result = {s}
+            \\    sentinel op arrived at the guest = {}
+            \\    entries held: host = {d}   guest = {d}   (want {d}/{d})
+            \\
+        , .{ n, protocol.MAX_OPS_BATCH_LEN, wcResultName(batch_result), sentinel_seen, host_held, guest_held, n, n });
+
+        try std.testing.expect(sentinel_seen);
+        // Predicted: 200 converges (control); 300 is applied by the host and
+        // dropped whole by the guest as BatchTooLarge — silent divergence.
+        try std.testing.expectEqual(n, host_held);
+        try std.testing.expectEqual(n, guest_held);
+
+        guest.leaveSession();
+        host.leaveSession();
+    }
+}
+
+test "W-COLLAB WC-9: a guest whose host vanished cannot cleanly rejoin, because its dead slot lingers" {
+    const allocator = std.testing.allocator;
+
+    var host1 = CollabManager.init(allocator);
+    defer host1.deinit();
+    const room1 = try wcHost(&host1, "Host1");
+
+    var guest = CollabManager.init(allocator);
+    defer guest.deinit();
+    try wcJoin(&guest, &host1, &room1, "Guest", 1);
+
+    host1.leaveSession();
+    const guest_went_idle = wcWaitNot(&guest, .connected) == .idle;
+    const offline_write = wcResultName(guest.mutate("model/v9", "\"x\""));
+    const slots_after_disconnect = wcConnectionCount(&guest);
+
+    var host2 = CollabManager.init(allocator);
+    defer host2.deinit();
+    const room2 = try wcHost(&host2, "Host2");
+
+    // Witness: rejoin directly, without an explicit leave first. The dead
+    // Host1 slot is still connections[0], so Host2's connection lands at
+    // index 1 — and the sync arm accepts only from index 0.
+    const dropped_before = guest.getMetricsSnapshot().inbound_unsigned_dropped;
+    guest.joinSession(&room2.code, room2.url(), "Guest") catch {};
+    const rejoin_state = wcWaitNot(&guest, .joining);
+    const refused_syncs = guest.getMetricsSnapshot().inbound_unsigned_dropped - dropped_before;
+    const rejoin_slots = wcConnectionCount(&guest);
+
+    // Control: an explicit leave clears the connection list, then a join
+    // lands the host at index 0 and the sync is accepted.
+    guest.leaveSession();
+    guest.joinSession(&room2.code, room2.url(), "Guest") catch {};
+    const retry_state = wcWaitNot(&guest, .joining);
+
+    std.debug.print(
+        \\
+        \\  WC-9: guest rejoin after the host disconnected
+        \\    guest auto-reset to idle                    = {}
+        \\    offline write result                        = {s}
+        \\    connection slots after disconnect           = {d}   (dead slot lingers)
+        \\    direct rejoin: refused syncs = {d}, slots = {d}, state = {s}
+        \\    control (leave then join): state            = {s}
+        \\
+    , .{
+        guest_went_idle,
+        offline_write,
+        slots_after_disconnect,
+        refused_syncs, rejoin_slots, @tagName(rejoin_state),
+        @tagName(retry_state),
+    });
+
+    try std.testing.expect(guest_went_idle);
+    try std.testing.expectEqual(session_mod.SessionState.connected, retry_state);
+    // Predicted RED: the direct rejoin stalls in .joining because the stale
+    // slot pushes the new host connection off index 0.
+    try std.testing.expectEqual(session_mod.SessionState.connected, rejoin_state);
+
+    guest.leaveSession();
+    host2.leaveSession();
+}
+
+test "W-COLLAB WC-10: leaving a room does not clear the CRDT, so a stale register shadows the next room" {
+    const allocator = std.testing.allocator;
+
+    var cap = InboundCapture.init(allocator);
+    defer cap.deinit();
+    var guest = CollabManager.init(allocator);
+    defer guest.deinit();
+    guest.setInboundOpCallback(&cap, InboundCapture.onOp);
+
+    const room1_value = "\"room1-data\"";
+    const room2_value = "\"room2-data\"";
+
+    var host1 = CollabManager.init(allocator);
+    defer host1.deinit();
+    const room1 = try wcHost(&host1, "Host1");
+    try wcJoin(&guest, &host1, &room1, "Guest", 1);
+    // Two writes to the same key so its version reaches 2.
+    try host1.mutate("model/v1", room1_value);
+    try host1.mutate("model/v1", room1_value);
+    const guest_had_room1 = wcWaitHolds(&guest, "model/v1", room1_value);
+
+    guest.leaveSession();
+    host1.leaveSession();
+
+    var host2 = CollabManager.init(allocator);
+    defer host2.deinit();
+    const room2 = try wcHost(&host2, "Host2");
+    // Host2's register is authoritative for room2 but carries version 1.
+    try host2.mutate("model/v1", room2_value);
+
+    const before_join = wcDeliveryCount(&guest, &cap);
+    try wcJoin(&guest, &host2, &room2, "Guest", 1);
+
+    // The guest still holds room1's value at version 2; host2's snapshot merges
+    // in at version 1 and LOSES the order, so room1 shadows room2.
+    const holds_room2 = wcWaitHolds(&guest, "model/v1", room2_value);
+    const holds_room1 = wcHolds(&guest, "model/v1", room1_value);
+    const handed_room2 = wcDeliveredSince(&guest, &cap, before_join, room2_value);
+    const handed_room1 = wcDeliveredSince(&guest, &cap, before_join, room1_value);
+
+    std.debug.print(
+        \\
+        \\  WC-10: rejoin a DIFFERENT room without the old CRDT cleared
+        \\    guest held room1 value before leaving       = {}
+        \\    after joining room2: holds room2 = {}   holds room1 (stale) = {}
+        \\    bridge handed room2 = {}   bridge handed room1 (stale) = {}
+        \\
+    , .{ guest_had_room1, holds_room2, holds_room1, handed_room2, handed_room1 });
+
+    try std.testing.expect(guest_had_room1);
+    // Predicted RED: leaveSession never clears crdt_doc, and LWW keeps the
+    // higher-versioned room1 register, so room2's model is fed room1's data.
+    try std.testing.expect(holds_room2 and handed_room2 and !handed_room1);
+
+    guest.leaveSession();
+    host2.leaveSession();
+}
