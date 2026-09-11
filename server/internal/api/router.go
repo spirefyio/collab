@@ -1,6 +1,14 @@
-// Package api wires the chi router for the collab HTTP API. Subsequent
-// commits add casbin RBAC, OAuth handlers, team CRUD, and WebSocket
-// relay routes.
+// Package api wires the chi router for the collab HTTP API.
+//
+// Mounted unconditionally: /, /health, /health/ready, /relay/ws. Mounted only
+// when an issuer is configured (COLLAB_JWT_SECRET): /me and
+// /teams/{teamID}/probe, behind jwtauth verification and casbin's
+// RequireAccess. Without the secret that whole group is absent, so those
+// paths answer 404 rather than 401.
+//
+// CORRECTION (2026-09-10): this comment previously said subsequent commits
+// would add casbin RBAC and WebSocket relay routes. Both have been wired
+// since Phase 0c; OAuth handlers and team CRUD are the parts still owed.
 package api
 
 import (

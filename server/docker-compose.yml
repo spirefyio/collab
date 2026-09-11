@@ -4,10 +4,15 @@
 #   - postgres   PostgreSQL 16 (data persisted in named volume)
 #   - server     the collab-server binary
 #
-# Both services can be replaced by external instances by overriding the
-# COLLAB_DATABASE_URL env var on the `server` service to point at an
-# existing Postgres (managed RDS, Cloud SQL, etc.), and by simply not
-# starting the `postgres` service.
+# Either service can be replaced by an external instance: override
+# COLLAB_DATABASE_URL on the `server` service to point at a managed Postgres
+# (RDS, Cloud SQL, ...) and start the server alone with
+#
+#   docker compose up --no-deps server
+#
+# --no-deps is required. `server` declares depends_on: postgres, so without it
+# compose starts and health-waits on the local Postgres anyway — the container
+# this arrangement exists to avoid.
 #
 # Quick start:
 #   docker compose up --build
@@ -16,6 +21,23 @@
 #
 # Stop + clean (drops data!):
 #   docker compose down --volumes
+#
+# The server applies pending migrations itself at boot. For the operator verbs
+# it cannot do — roll back, report the version, clear a dirty flag — the same
+# image carries collab-migrate:
+#
+#   docker compose run --rm --build --entrypoint collab-migrate server version
+#   docker compose run --rm --build --entrypoint collab-migrate server down 1
+#
+# --build is part of the command, not an optimisation. `run` on its own does
+# NOT rebuild, so a stale image — anything built before collab-migrate was
+# added — fails with "executable file not found in $PATH". Folding the build
+# into the one command an operator is told to type makes that trap
+# unreachable through the documented path, which a warning alone did not.
+#
+# Running the verbs through the image rather than a local build is also how an
+# operator guarantees the migration set matches what the server was deployed
+# with; see server/migrations/README.md.
 
 services:
   postgres:

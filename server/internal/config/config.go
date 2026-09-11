@@ -23,10 +23,10 @@ type Config struct {
 
 	DatabaseURL string
 
-	JWTSecret  []byte
-	JWTIssuer  string
+	JWTSecret   []byte
+	JWTIssuer   string
 	JWTAudience string
-	JWTTTL     time.Duration
+	JWTTTL      time.Duration
 
 	OAuthGoogleClientID     string
 	OAuthGoogleClientSecret string
@@ -42,19 +42,19 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		ListenAddr:           getEnv("COLLAB_LISTEN_ADDR", ":8443"),
-		DatabaseURL:          os.Getenv("COLLAB_DATABASE_URL"),
-		JWTIssuer:            getEnv("COLLAB_JWT_ISSUER", "spirefyio/collab"),
-		JWTAudience:          getEnv("COLLAB_JWT_AUDIENCE", "spirefy-collab-clients"),
-		JWTTTL:               getDuration("COLLAB_JWT_TTL", 24*time.Hour),
+		ListenAddr:              getEnv("COLLAB_LISTEN_ADDR", ":8443"),
+		DatabaseURL:             os.Getenv("COLLAB_DATABASE_URL"),
+		JWTIssuer:               getEnv("COLLAB_JWT_ISSUER", "spirefyio/collab"),
+		JWTAudience:             getEnv("COLLAB_JWT_AUDIENCE", "spirefy-collab-clients"),
+		JWTTTL:                  getDuration("COLLAB_JWT_TTL", 24*time.Hour),
 		OAuthGoogleClientID:     os.Getenv("COLLAB_OAUTH_GOOGLE_CLIENT_ID"),
 		OAuthGoogleClientSecret: os.Getenv("COLLAB_OAUTH_GOOGLE_CLIENT_SECRET"),
 		OAuthGitHubClientID:     os.Getenv("COLLAB_OAUTH_GITHUB_CLIENT_ID"),
 		OAuthGitHubClientSecret: os.Getenv("COLLAB_OAUTH_GITHUB_CLIENT_SECRET"),
 		OAuthRedirectBaseURL:    os.Getenv("COLLAB_OAUTH_REDIRECT_BASE_URL"),
-		WSReadBufferBytes:    getInt("COLLAB_WS_READ_BUFFER_BYTES", 4096),
-		WSWriteBufferBytes:   getInt("COLLAB_WS_WRITE_BUFFER_BYTES", 4096),
-		Production:           getBool("COLLAB_PRODUCTION", false),
+		WSReadBufferBytes:       getInt("COLLAB_WS_READ_BUFFER_BYTES", 4096),
+		WSWriteBufferBytes:      getInt("COLLAB_WS_WRITE_BUFFER_BYTES", 4096),
+		Production:              getBool("COLLAB_PRODUCTION", false),
 	}
 
 	if secret := os.Getenv("COLLAB_JWT_SECRET"); secret != "" {
