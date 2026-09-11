@@ -8,8 +8,8 @@ Relay broker + team service for spirefyio/collab. Written in Go.
 - **jwtauth** — JWT auth middleware (added in a follow-up commit)
 - **casbin** — RBAC enforcement (added in a follow-up commit)
 - **gorilla/websocket** — opaque relay broker (added in a follow-up commit)
-- **pgx** — Postgres driver (added in a follow-up commit)
-- **golang-migrate** — schema migrations (added in a follow-up commit)
+- **pgx** — Postgres driver (runtime pool + migration driver)
+- **golang-migrate** — schema migrations, applied at boot and operable via `cmd/collab-migrate` (see [migrations/README.md](migrations/README.md))
 - **OAuth2** — Google + GitHub identity (added in a follow-up commit)
 
 ## Quick start — local Go
@@ -73,6 +73,33 @@ local dev. Production must set `COLLAB_PRODUCTION=1`, which then enforces:
 - `COLLAB_DATABASE_URL` — Postgres connection string
 - `COLLAB_OAUTH_REDIRECT_BASE_URL` — public URL for OAuth callbacks
 
+## Database migrations
+
+The server migrates itself at boot: with `COLLAB_DATABASE_URL` set,
+`cmd/relay` applies every pending migration before opening the runtime pool,
+and it is a no-op when already at head. Deploying a build migrates the
+database.
+
+`cmd/collab-migrate` is the operator CLI for everything boot cannot do:
+
+```bash
+make db-start                    # compose Postgres, waits for pg_isready
+make db-version                  # applied version, dirty flag, head, pending
+make db-up                       # apply pending (ahead of a deploy)
+make db-down N=1                 # roll back one migration
+make db-goto V=1                 # migrate to exactly version 1
+make db-new NAME=add_sessions    # scaffold the next up/down pair
+make db-reset CONFIRM=yes        # down to empty, back up to head
+make db-force V=1 CONFIRM=yes    # recover a dirty schema (runs no SQL)
+make test-integration            # run the suite against a real Postgres
+```
+
+Destructive verbs are gated twice — `CONFIRM=yes` at the Makefile and `-yes`
+at the CLI — and the CLI has no default database URL, because a default is
+how an operator migrates the wrong database. Conventions for writing a
+migration, and the dirty-schema runbook, are in
+[migrations/README.md](migrations/README.md).
+
 ## Architecture
 
 See [../README.md](../README.md) for the overall multi-channel CRDT
@@ -81,10 +108,22 @@ architecture. This server hosts two surfaces:
 1. **Relay broker** (`/relay/ws`) — opaque WebSocket forwarding. Never
    decrypts CRDT payloads. Used by both ad-hoc Share/Join sessions and
    team-mode workspaces.
-2. **REST API** (`/auth`, `/teams`, `/workspaces`, `/invites`) — team
-   management. Auth is JWT issued after OAuth login. RBAC via casbin.
+2. **REST API** — team management. Auth is JWT issued after OAuth login,
+   RBAC via casbin.
+
+   CORRECTION (2026-09-10): this list previously read
+   ``/auth`, `/teams`, `/workspaces`, `/invites``, none of which exist.
+   The mounted routes are exactly `/`, `/health`, `/health/ready`,
+   `/relay/ws`, `/me`, and `/teams/{teamID}/probe` — and the last is
+   explicitly a placeholder proving the JWT + casbin pipe
+   (`internal/api/teams.go`). `internal/store/` is empty and nothing
+   references `oauth2`, so the CRUD, the Postgres store, and the OAuth login
+   this section describes are all still owed. The schema those tables live in
+   *is* real (`migrations/0001_init.up.sql`); the handlers over it are not.
 
 ## Status
 
-Pre-1.0 — skeleton landing in stages. See commits on
-`kevin/phase-0c-server-skeleton`.
+Pre-1.0 — landing in stages. Working today: the relay broker, JWT issuance
+and verification, casbin enforcement, the Postgres pool, and the full
+migration surface above. Owed: the team/workspace/invite store and handlers
+(`internal/store/` is empty), and OAuth login (no `oauth2` consumer yet).

@@ -16,6 +16,15 @@
 #
 # Stop + clean (drops data!):
 #   docker compose down --volumes
+#
+# The server applies pending migrations itself at boot. For the operator verbs
+# it cannot do — roll back, report the version, clear a dirty flag — the same
+# image carries collab-migrate. Note that `run` does NOT rebuild, so an image
+# built before collab-migrate existed fails with "executable file not found":
+#   docker compose build server
+#   docker compose run --rm --entrypoint collab-migrate server version
+#   docker compose run --rm --entrypoint collab-migrate server down 1
+# See server/migrations/README.md.
 
 services:
   postgres:

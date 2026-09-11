@@ -26,6 +26,15 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X github.com/spirefyio/collab/server/internal/config.Version=${VERSION}-${GIT_SHA}" \
     -o /out/collab-server ./${BUILD_TARGET}
 
+# The operator CLI ships in the same image. Without it a deployed container
+# can migrate FORWARD (the server does that itself at boot) but has no way to
+# roll back, report its schema version, or clear a dirty flag — so a failed
+# migration in production would need a separate image to recover from.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w -X github.com/spirefyio/collab/server/internal/config.Version=${VERSION}-${GIT_SHA}" \
+    -o /out/collab-migrate ./cmd/collab-migrate
+
 # ----- runtime stage ------------------------------------------------
 FROM alpine:3.20 AS runtime
 
@@ -33,6 +42,7 @@ RUN apk --no-cache add ca-certificates wget && \
     addgroup -S collab && adduser -S -G collab collab
 
 COPY --from=builder /out/collab-server /usr/local/bin/collab-server
+COPY --from=builder /out/collab-migrate /usr/local/bin/collab-migrate
 
 USER collab
 WORKDIR /home/collab
