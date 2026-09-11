@@ -30,6 +30,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # can migrate FORWARD (the server does that itself at boot) but has no way to
 # roll back, report its schema version, or clear a dirty flag — so a failed
 # migration in production would need a separate image to recover from.
+#
+# The -X stamp below is the same one the server build uses, and it was a
+# silent no-op until collab-migrate imported internal/config: the linker
+# ignores -X for a package that is not linked in, with no error. It is
+# load-bearing now — `collab-migrate version` prints the build it came from,
+# which is what lets an operator confirm the CLI they are recovering with
+# matches the server that broke.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X github.com/spirefyio/collab/server/internal/config.Version=${VERSION}-${GIT_SHA}" \

@@ -1,11 +1,19 @@
 // Spirefy collab — relay + team service entrypoint.
 //
 // Boots an HTTP server (chi router) exposing:
-//   - /health           liveness probe
 //   - /                 service banner
-//   - /relay/ws         WebSocket relay (added in a follow-up commit)
-//   - /auth/oauth/*     OAuth callbacks (added in a follow-up commit)
-//   - /teams/*          team CRUD (added in a follow-up commit)
+//   - /health           liveness probe
+//   - /health/ready     readiness (db ping + relay status)
+//   - /relay/ws         opaque WebSocket relay
+//
+// and, only when COLLAB_JWT_SECRET is set, a JWT + casbin protected group:
+//   - /me
+//   - /teams/{teamID}/probe   placeholder proving the auth pipe
+//
+// CORRECTION (2026-09-10): this list previously named /auth/oauth/* and
+// /teams/* as "added in a follow-up commit". Neither is mounted; team CRUD
+// and OAuth are still owed, and saying they were coming implied a route
+// table that has never existed. See server/README.md Status.
 //
 // Graceful shutdown on SIGINT / SIGTERM with a 30s drain budget.
 package main
@@ -59,6 +67,17 @@ func main() {
 	}
 
 	if cfg.DatabaseURL != "" {
+		// Say so BEFORE constructing the migrator. Under contention the
+		// construction itself blocks indefinitely (see MigrationLockHeld),
+		// so a line logged after it would never be reached -- which is
+		// exactly the silent startup hang this probe exists to name.
+		if held, err := dbpkg.MigrationLockHeld(cfg.DatabaseURL); err != nil {
+			logger.Warn("could not probe the migration lock; continuing", "err", err)
+		} else if held {
+			logger.Warn("another process is holding the migration lock; waiting for it to finish " +
+				"(this wait is unbounded by design: the lock is session-scoped, so a crashed " +
+				"holder releases it and this replica proceeds)")
+		}
 		logger.Info("running database migrations")
 		if err := dbpkg.RunUp(cfg.DatabaseURL, migrations.FS); err != nil {
 			logger.Error("migration failed", "err", err)

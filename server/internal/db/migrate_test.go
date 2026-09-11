@@ -45,16 +45,34 @@ func TestMigrationsFS_IncludesUpAndDown(t *testing.T) {
 }
 
 func TestRunUp_AcceptsCustomFS(t *testing.T) {
-	// Smoke: pass an empty in-memory FS — should fail at the
-	// migrate.New step, not crash. Validates that the function
-	// composes correctly with an arbitrary fs.FS.
+	// Passing an arbitrary fs.FS must get as far as the DATABASE before
+	// failing — that is the only thing this arm can show without a server.
+	//
+	// It originally asserted only err != nil, which made it a duplicate of
+	// TestRunUp_HandlesUnreachableDB: both fail on the same dial to
+	// 192.0.2.1, so a regression that broke fs.FS handling outright would
+	// still have passed here. Asserting the error KIND gives it a distinct
+	// blind spot: an iofs-level failure now reads differently from a dial
+	// failure. The positive case — a custom FS whose migrations actually
+	// apply — needs a real server and lives in
+	// TestMigrate_AcceptsCustomFS in the integration suite.
 	custom := fstest.MapFS{
-		"0002_noop.up.sql":   {Data: []byte("SELECT 1;")},
-		"0002_noop.down.sql": {Data: []byte("SELECT 1;")},
+		"0001_noop.up.sql":   {Data: []byte("SELECT 1;")},
+		"0001_noop.down.sql": {Data: []byte("SELECT 1;")},
 	}
 	err := RunUp("postgres://user:pass@192.0.2.1:5432/db?sslmode=disable&connect_timeout=1", custom)
 	if err == nil {
 		t.Fatal("expected error against unreachable DB")
+	}
+	// The source driver must have accepted the FS; failure must come from
+	// the connection attempt, not from reading the migrations.
+	for _, sourceLevel := range []string{"iofs source", "first migration"} {
+		if strings.Contains(err.Error(), sourceLevel) {
+			t.Fatalf("custom fs.FS was rejected at the source layer (%q): %v", sourceLevel, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "migrate driver") {
+		t.Errorf("expected the failure to come from the database connection, got: %v", err)
 	}
 }
 

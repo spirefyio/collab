@@ -6,9 +6,9 @@
 // where it currently is, recover it after a failed apply, and scaffold the
 // next migration pair.
 //
-// The migration set is compiled in (migrations.FS), so `up`, `down`, `goto`,
-// `steps`, `force` and `version` run the exact SQL the matching server build
-// ships — an operator cannot accidentally apply a different tree's
+// The migration set is compiled in (migrations.FS), so `up`, `down`,
+// `down-all`, `goto`, `force` and `version` run the exact SQL the matching
+// server build ships — an operator cannot accidentally apply a different tree's
 // migrations. `create` is the one exception: it writes new files, so it
 // works against a source directory (-dir).
 //
@@ -22,9 +22,10 @@
 //
 //	version              print applied version, dirty flag, head, pending count
 //	up [n]               apply all pending migrations, or n of them
-//	down n               roll back n migrations
+//	down n     -yes      roll back n migrations (drops what they created)
 //	down-all   -yes      roll back EVERY migration (drops all data)
-//	goto v               migrate up or down to exactly version v (0 == down-all)
+//	goto v     [-yes]    migrate to exactly version v; -yes required when that
+//	                     means rolling back (v below the applied version, or 0)
 //	force v    -yes      stamp version v and clear the dirty flag, running no SQL
 //	create name [-dir d] scaffold the next NNNN_name.{up,down}.sql pair
 package main
@@ -33,12 +34,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/spirefyio/collab/server/internal/config"
 	"github.com/spirefyio/collab/server/internal/db"
 	"github.com/spirefyio/collab/server/migrations"
 )
@@ -61,13 +65,139 @@ func main() {
 		os.Exit(2)
 	}
 
-	if err := run(args, url, confirm, dir); err != nil {
+	if err := run(args, url, confirm, dir, migrations.FS); err != nil {
+		// A dirty schema is a reportable state, not a tool failure: the
+		// warning is already on stderr, so exit distinctly and say no more.
+		if errors.As(err, &dirtyStatusError{}) {
+			os.Exit(3)
+		}
 		fmt.Fprintf(os.Stderr, "collab-migrate: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, url string, confirm bool, dir string) error {
+// plan is the parsed, validated form of a command line. Parsing is separated
+// from execution so that argument validation and the confirmation gate are
+// pure functions over a plan — they are decided BEFORE any database
+// connection is opened, which is what makes them testable without a Postgres
+// and what guarantees a refusal costs no connection.
+type plan struct {
+	cmd  string
+	n    int   // step count for `up n` / `down n`
+	v    int64 // target version for `goto` / `force`
+	hasN bool
+	hasV bool
+}
+
+func parsePlan(cmd string, rest []string) (plan, error) {
+	p := plan{cmd: cmd}
+	switch cmd {
+	case "version", "status", "down-all":
+		if len(rest) != 0 {
+			return p, fmt.Errorf("%s takes no arguments", cmd)
+		}
+
+	case "up":
+		switch len(rest) {
+		case 0:
+		case 1:
+			n, err := positiveInt(rest[0])
+			if err != nil {
+				return p, fmt.Errorf("up: %w", err)
+			}
+			p.n, p.hasN = n, true
+		default:
+			return p, errors.New("up takes at most one argument: collab-migrate up [n]")
+		}
+
+	case "down":
+		if len(rest) != 1 {
+			return p, errors.New("down requires a step count (use down-all to roll back everything)")
+		}
+		n, err := positiveInt(rest[0])
+		if err != nil {
+			return p, fmt.Errorf("down: %w", err)
+		}
+		p.n, p.hasN = n, true
+
+	case "goto":
+		if len(rest) != 1 {
+			return p, errors.New("goto requires a target version")
+		}
+		v, err := strconv.ParseUint(rest[0], 10, 64)
+		if err != nil {
+			return p, fmt.Errorf("goto: %q is not a version number", rest[0])
+		}
+		// Guard the uint64 -> uint narrowing that Goto's signature forces.
+		// On a 32-bit build an out-of-range value would otherwise truncate,
+		// and a value truncating to 0 would reach Down having skipped the
+		// v == 0 confirmation gate below.
+		if uint64(uint(v)) != v {
+			return p, fmt.Errorf("goto: version %s is out of range on this platform", rest[0])
+		}
+		p.v, p.hasV = int64(v), true
+
+	case "force":
+		if len(rest) != 1 {
+			return p, errors.New("force requires a version")
+		}
+		v, err := strconv.ParseInt(rest[0], 10, 64)
+		if err != nil {
+			return p, fmt.Errorf("force: %q is not a version number", rest[0])
+		}
+		if v < -1 {
+			return p, fmt.Errorf("force: %d is not a valid version (-1 means \"no migration applied\")", v)
+		}
+		if v > int64(^uint(0)>>1) {
+			return p, fmt.Errorf("force: version %s is out of range on this platform", rest[0])
+		}
+		p.v, p.hasV = v, true
+
+	default:
+		return p, fmt.Errorf("unknown command %q (try: version, up, down, down-all, goto, force, create)", cmd)
+	}
+	return p, nil
+}
+
+// destructive reports whether this plan runs rollback SQL or rewrites the
+// schema bookkeeping, WITHOUT consulting the database. The one destructive
+// case it cannot decide statically is `goto v` for v > 0, which is a rollback
+// only when v is below the currently applied version — checked at execution,
+// where the version is known.
+//
+// Every verb that runs a .down.sql is in here. `down n` was NOT, originally:
+// with a single-migration set, `down 1` drops every table in the schema — the
+// same blast radius as down-all, which has always required -yes. Two
+// independent reviewers flagged it on the same commit.
+func (p plan) destructive() (bool, string) {
+	switch p.cmd {
+	case "down":
+		return true, fmt.Sprintf("down %d runs %d rollback migration(s) and drops what they created", p.n, p.n)
+	case "down-all":
+		return true, "down-all rolls back every migration and drops all data"
+	case "force":
+		return true, "force rewrites schema bookkeeping without running SQL; it is only correct if you have confirmed the schema matches that version"
+	case "goto":
+		if p.v == 0 {
+			return true, "goto 0 is equivalent to down-all and drops all data"
+		}
+	}
+	return false, ""
+}
+
+// run takes the migration set as a parameter rather than reaching for
+// migrations.FS directly so that the descending-goto gate below is reachable
+// from a test.
+//
+// That gate is the only destructive check in this file that cannot be decided
+// from argv: `goto 1` is a forward migration on an empty schema and a rollback
+// on a schema at version 2, so it has to read the applied version at
+// execution time. The shipped set currently contains one migration, which
+// means no non-zero descent exists to point it at -- an earlier test aimed
+// `goto 0` at it and passed on the STATIC destructive() gate instead,
+// confirming nothing. A parameter is the smallest seam that lets the arm
+// construct a two-version history and actually exercise the runtime branch.
+func run(args []string, url string, confirm bool, dir string, set fs.FS) error {
 	cmd := args[0]
 	rest := args[1:]
 
@@ -75,134 +205,205 @@ func run(args []string, url string, confirm bool, dir string) error {
 	// URL requirement — scaffolding a migration must work offline.
 	if cmd == "create" {
 		if len(rest) != 1 {
-			return errors.New("create requires exactly one name: collab-migrate create add_sessions_table")
+			return errors.New("create requires exactly one name: collab-migrate create add_sessions_table\n" +
+				"(flags must come BEFORE the subcommand: `collab-migrate -dir DIR create NAME`, " +
+				"not `create NAME -dir DIR` — Go's flag parser stops at the first non-flag argument, " +
+				"so trailing flags arrive here as extra names)")
 		}
 		return create(dir, rest[0])
+	}
+
+	p, err := parsePlan(cmd, rest)
+	if err != nil {
+		return err
 	}
 
 	if url == "" {
 		return errors.New("no database URL: pass -url or set COLLAB_DATABASE_URL")
 	}
 
-	mg, err := db.NewMigrator(url, migrations.FS)
+	// Gate before connecting: a refusal must not open a connection, and this
+	// check must be decidable without one.
+	destructive, why := p.destructive()
+	if destructive && !confirm {
+		// Name the target in the REFUSAL, not only in the echo below. The
+		// refusal is the one message an operator who typed this out of
+		// local-dev habit is guaranteed to read, and "which database" is
+		// the fact that decides whether they should retype it with -yes.
+		return fmt.Errorf("%s\ntarget:   %s\nre-run with -yes to confirm", why, redactURL(url))
+	}
+
+	// Name the TARGET, not just the intent. -yes and the Makefile's
+	// CONFIRM=yes both confirm "be destructive"; neither confirms "against
+	// this database". COLLAB_DATABASE_URL decides that silently, and an
+	// operator with it exported for the running server gets no on-screen tell
+	// that a habitual `down 1` is pointed at production. So every destructive
+	// verb announces its resolved target first, credentials stripped.
+	if destructive {
+		fmt.Fprintf(os.Stderr, "%s\ntarget:   %s\n\n", why, redactURL(url))
+	}
+
+	// Same unbounded wait as the server's boot path, and the same reason to
+	// announce it first: NewMigrator blocks inside golang-migrate's
+	// ensureVersionTable while a peer holds the lock, so an operator who
+	// typed a verb and got no output at all needs to know it is waiting
+	// rather than wedged.
+	if held, lerr := db.MigrationLockHeld(url); lerr != nil {
+		fmt.Fprintf(os.Stderr, "note: could not probe the migration lock (%v); continuing\n", lerr)
+	} else if held {
+		fmt.Fprint(os.Stderr, "note: another process holds the migration lock; waiting for it to finish\n")
+	}
+
+	mg, err := db.NewMigrator(url, set)
 	if err != nil {
 		return err
 	}
 	defer mg.Close()
 
-	switch cmd {
+	switch p.cmd {
 	case "version", "status":
-		return printStatus(mg)
-
-	case "up":
-		switch len(rest) {
-		case 0:
-			if err := mg.Up(); err != nil {
-				return err
-			}
-		case 1:
-			n, err := positiveInt(rest[0])
-			if err != nil {
-				return fmt.Errorf("up: %w", err)
-			}
-			if err := mg.Steps(n); err != nil {
-				return err
-			}
-		default:
-			return errors.New("up takes at most one argument: collab-migrate up [n]")
-		}
-		return printStatus(mg)
-
-	case "down":
-		if len(rest) != 1 {
-			return errors.New("down requires a step count (use down-all -yes to roll back everything)")
-		}
-		n, err := positiveInt(rest[0])
+		dirty, err := printStatus(mg)
 		if err != nil {
-			return fmt.Errorf("down: %w", err)
-		}
-		if err := mg.Steps(-n); err != nil {
 			return err
 		}
-		return printStatus(mg)
+		if dirty {
+			return dirtyStatusError{}
+		}
+		return nil
+
+	case "up":
+		if p.hasN {
+			if err := mg.Steps(p.n); err != nil {
+				return err
+			}
+		} else if err := mg.Up(); err != nil {
+			return err
+		}
+		_, err := printStatus(mg)
+		return err
+
+	case "down":
+		if err := mg.Steps(-p.n); err != nil {
+			return err
+		}
+		_, err := printStatus(mg)
+		return err
 
 	case "down-all":
-		if !confirm {
-			return errors.New("down-all drops every table and all data; re-run with -yes to confirm")
-		}
 		if err := mg.Down(); err != nil {
 			return err
 		}
-		return printStatus(mg)
+		_, err := printStatus(mg)
+		return err
 
 	case "goto":
-		if len(rest) != 1 {
-			return errors.New("goto requires a target version")
+		// The remaining destructive case: descending to a version below the
+		// one applied runs rollback SQL, and only the database knows which
+		// direction that is.
+		if !confirm {
+			st, err := mg.Status()
+			if err != nil {
+				return err
+			}
+			if st.Applied && uint64(p.v) < uint64(st.Version) {
+				return fmt.Errorf("goto %d rolls back from version %d and drops what those migrations created; re-run with -yes to confirm", p.v, st.Version)
+			}
 		}
-		v, err := strconv.ParseUint(rest[0], 10, 64)
-		if err != nil {
-			return fmt.Errorf("goto: %q is not a version number", rest[0])
-		}
-		if v == 0 && !confirm {
-			return errors.New("goto 0 is equivalent to down-all and drops all data; re-run with -yes to confirm")
-		}
-		if err := mg.Goto(uint(v)); err != nil {
+		if err := mg.Goto(uint(p.v)); err != nil {
 			return err
 		}
-		return printStatus(mg)
+		_, err := printStatus(mg)
+		return err
 
 	case "force":
-		if len(rest) != 1 {
-			return errors.New("force requires a version")
-		}
-		v, err := strconv.Atoi(rest[0])
-		if err != nil {
-			return fmt.Errorf("force: %q is not a version number", rest[0])
-		}
-		if !confirm {
-			return errors.New("force rewrites schema bookkeeping without running SQL; only correct if you have confirmed the schema matches that version — re-run with -yes")
-		}
-		if err := mg.Force(v); err != nil {
+		if err := mg.Force(int(p.v)); err != nil {
 			return err
 		}
-		return printStatus(mg)
-
-	default:
-		return fmt.Errorf("unknown command %q (try: version, up, down, down-all, goto, force, create)", cmd)
+		_, err := printStatus(mg)
+		return err
 	}
+	// parsePlan rejects every other command, so this is unreachable.
+	return fmt.Errorf("unhandled command %q", p.cmd)
 }
 
-func printStatus(mg *db.Migrator) error {
-	head, err := mg.Head()
+// dirtyStatusError makes `version`/`status` exit non-zero on a dirty schema.
+// The command's whole job is to report health, and automation commonly gates
+// on the exit code alone — returning 0 there is a false all-clear. It carries
+// no message of its own because printStatus already wrote the warning, and
+// main() maps it to exit 3 (distinct from 1 = failure, 2 = usage) without
+// printing anything further.
+type dirtyStatusError struct{}
+
+func (dirtyStatusError) Error() string { return "schema is dirty" }
+
+// redactURL renders a database URL safe to print: credentials stripped,
+// everything an operator needs to recognize the target kept.
+//
+// It takes the raw string rather than a *url.URL because the failure path is
+// the point: net/url.Error.Error embeds its raw input VERBATIM, password and
+// all, so a parse failure reported with %w would leak exactly what this
+// function exists to strip. On a URL we cannot parse we print a fixed string
+// and say nothing about its contents.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
 	if err != nil {
-		return err
+		return "(unparseable database URL)"
 	}
+	return u.Redacted()
+}
 
-	version, dirty, err := mg.Version()
-	if errors.Is(err, db.ErrNoVersion) {
-		version = 0
-		dirty = false
-	} else if err != nil {
-		return fmt.Errorf("read version: %w", err)
-	}
-
-	pending, err := mg.PendingAfter(version)
+// printStatus formats the status block and reports whether the schema is
+// dirty. All normalization lives in db.Migrator.Status, which is tested
+// against a real database; this function only renders.
+func printStatus(mg *db.Migrator) (bool, error) {
+	st, err := mg.Status()
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	if version == 0 {
-		fmt.Printf("version:  none (empty database)\nhead:     %d\npending:  %d\n", head, pending)
-		return nil
+	// Which BINARY, not just which schema. The recovery runbook tells an
+	// operator to match their checkout to the build the server was deployed
+	// from, and until this line existed nothing here could answer that: the
+	// Dockerfile stamped internal/config.Version onto this binary too, but
+	// the package was never linked in, so the -X was a silent no-op
+	// (measured: go list -deps ./cmd/collab-migrate does not include it).
+	fmt.Printf("binary:   %s\n", config.Version)
+
+	if !st.Applied {
+		fmt.Printf("version:  none (empty database)\ndirty:    %t\nhead:     %d\npending:  %d\n",
+			st.Dirty, st.Head, st.Pending)
+		if st.Dirty {
+			fmt.Fprint(os.Stderr,
+				"\nWARNING: schema is DIRTY at version -1 — a rollback failed on its last\n"+
+					"migration, so the schema is not actually empty and every other verb will\n"+
+					"refuse. Inspect what the failed rollback left behind, then either:\n"+
+					"  collab-migrate force -1 -yes        (schema really is empty)\n"+
+					"  collab-migrate force <version> -yes (schema matches that version)\n")
+		}
+		return st.Dirty, nil
 	}
-	fmt.Printf("version:  %d\ndirty:    %t\nhead:     %d\npending:  %d\n", version, dirty, head, pending)
-	if dirty {
+
+	fmt.Printf("version:  %d\ndirty:    %t\nhead:     %d\npending:  %d\n",
+		st.Version, st.Dirty, st.Head, st.Pending)
+	if !st.Known {
+		// Without this the output above is indistinguishable from a healthy,
+		// fully-migrated schema: dirty false, pending 0. Every number in it
+		// is computed against a set that does not contain the schema's
+		// actual position.
+		fmt.Fprintf(os.Stderr,
+			"\nWARNING: version %d does not exist in this binary's migration set (head is %d).\n"+
+				"The database was migrated by a different build, or forced to a version that was\n"+
+				"never a migration. 'pending' above is counted against a set the schema is not in.\n"+
+				"Run the build that owns version %d, or force to a version this build knows.\n",
+			st.Version, st.Head, st.Version)
+	}
+	if st.Dirty {
 		fmt.Fprintf(os.Stderr,
 			"\nWARNING: schema is DIRTY — migration %d failed partway and every other verb\n"+
 				"will refuse until this is resolved. Inspect the schema, decide which version it\n"+
-				"actually matches, then: collab-migrate force <version> -yes\n", version)
+				"actually matches, then: collab-migrate force <version> -yes\n", st.Version)
 	}
-	return nil
+	return st.Dirty, nil
 }
 
 func positiveInt(s string) (int, error) {
@@ -305,6 +506,7 @@ func create(dir, name string) error {
 }
 
 func usage() {
+	fmt.Fprintf(os.Stderr, "collab-migrate %s\n\n", config.Version)
 	fmt.Fprint(os.Stderr, `collab-migrate — operator CLI for the collab-server schema
 
 usage: collab-migrate [-url URL] <command> [args]
@@ -312,11 +514,20 @@ usage: collab-migrate [-url URL] <command> [args]
 commands:
   version              applied version, dirty flag, head, pending count
   up [n]               apply all pending migrations, or only n of them
-  down n               roll back n migrations
+  down n -yes          roll back n migrations (DROPS what they created)
   down-all -yes        roll back every migration (DROPS ALL DATA)
-  goto v               migrate up or down to exactly version v (0 == down-all)
+  goto v [-yes]        migrate to exactly version v; -yes required when that
+                       means rolling back (v below the applied version, or 0)
   force v -yes         stamp version v, clear dirty, run no SQL (recovery verb)
+                       v may be -1, meaning "no migration applied" — the
+                       recovery for a rollback that failed on its last step
   create name [-dir d] scaffold the next NNNN_name.{up,down}.sql pair
+
+exit codes:
+  0  success
+  1  failure
+  2  usage error (no command)
+  3  version/status ran fine and the schema is DIRTY
 
 flags:
   -url URL   postgres URL; defaults to $COLLAB_DATABASE_URL
@@ -326,7 +537,7 @@ flags:
 examples:
   collab-migrate version
   collab-migrate up
-  collab-migrate down 1
+  collab-migrate down 1 -yes
   collab-migrate create add_sessions_table
 `)
 }

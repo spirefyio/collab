@@ -1,0 +1,105 @@
+name: collab go server
+
+# ── CI cost policy ───────────────────────────────────────────────────────────
+# build.yml is MANUAL-ONLY because installing the Zig toolchain and building
+# the sibling repos is expensive. This workflow is not: it is a stock Go
+# toolchain, one module, and a Postgres service container, and it finishes in
+# well under a minute. So it runs automatically — but ONLY on changes under
+# server/ (plus this file), which keeps it off every docs or Zig-side commit.
+#
+# The gap this closes was found by three independent review lenses at once:
+# before it existed, NOTHING in this repo's automation built, vetted, or tested
+# server/ — not on push, not on dispatch. A PR that broke the build, broke a
+# .down.sql round-trip, or regressed a destructive-verb gate would have merged
+# green, because there was no signal at all.
+#
+# If the automatic trigger turns out to be unwanted, deleting the `push` and
+# `pull_request` blocks leaves a working manual workflow behind.
+on:
+  push:
+    paths:
+      - "server/**"
+      - ".github/workflows/go.yml"
+  pull_request:
+    paths:
+      - "server/**"
+      - ".github/workflows/go.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: server
+
+jobs:
+  test:
+    name: build, vet, test (with Postgres)
+    runs-on: ubuntu-latest
+
+    # A service container rather than docker-compose: GitHub health-gates the
+    # job on it, so the migration tests cannot race a Postgres that is still
+    # starting. The credentials are throwaway and local to the runner.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: collab
+          POSTGRES_PASSWORD: collab
+          POSTGRES_DB: collab
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U collab -d collab"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # Both binaries, for the target the Dockerfile actually ships, so a
+      # cross-compile break is caught here rather than at image build time.
+      - name: cross-compile the release targets
+        run: CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./cmd/relay ./cmd/collab-migrate
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go test (with a real Postgres)
+        # `shell: bash` is load-bearing, not decoration. The runner's DEFAULT
+        # shell is `bash -e {0}` with no pipefail, so `go test | tee` would
+        # report tee's exit status and a failing suite would go green. Naming
+        # bash explicitly gets `-eo pipefail`.
+        shell: bash
+        env:
+          COLLAB_TEST_DATABASE_URL: postgres://collab:collab@localhost:5432/collab?sslmode=disable
+        run: go test -race -count=1 ./... 2>&1 | tee test.log
+
+      # The integration arms SKIP when COLLAB_TEST_DATABASE_URL is unset. That
+      # is correct for a laptop and a silent green here: if the variable ever
+      # stops reaching the job, every migration test would vanish from the run
+      # and the build would still pass. Fail instead.
+      - name: no integration arm may have skipped
+        run: |
+          if grep -q -- "--- SKIP" test.log; then
+            echo "an arm skipped despite COLLAB_TEST_DATABASE_URL being set:"
+            grep -- "--- SKIP" test.log
+            exit 1
+          fi
