@@ -636,7 +636,7 @@ test "PLANT: every collab host fn carries a capability AND a caller-scoped handl
 }
 
 test "the capability is a real, satisfiable, correctly-scoped node" {
-    const cap = zora.pe.types.capability;
+    const cap = zora.pe.types;
     // Well-formed by the grammar. A capability that fails validation would be a
     // fn that looks gated and is simply unreachable — a different bug wearing
     // security's clothes.
